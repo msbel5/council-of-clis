@@ -66,7 +66,14 @@ def client(fake_registry):
         yield c
 
 
-def _collect_until(ws, kind: str, cli: str = "*", limit: int = 200) -> list[dict]:
+def _collect_until(ws, kind: str, cli: str = "*", limit: int = 600) -> list[dict]:
+    """Read WS messages until {cli, kind} or limit hit.
+
+    Limit bumped from 200 to 600 because cascade mode with FAKE_CLI_ECHO_FULL=1
+    + DSU injection produces enough per-line stdout events across 4 cascade
+    steps (draft/critique/revise/validate) × prompts that include peer DSU
+    blocks that the original 200 was hit before batch_done.
+    """
     events = []
     for _ in range(limit):
         msg = ws.receive_json()
