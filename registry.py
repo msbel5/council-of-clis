@@ -9,7 +9,7 @@ Built-in entries can be DISABLED (not redefined) by the user setting
 `disabled = false` plus a new command override-replaces the built-in entry.
 
 User overrides win on name collision. We never silently drop entries — invalid ones
-raise `RegistryError` at load time.
+raise `RegistryError` at load time. Same fail-fast policy applies to options_schema.
 """
 
 from __future__ import annotations
@@ -31,6 +31,74 @@ class RegistryError(ValueError):
     """Raised when a registry entry is missing required fields or has bad shape."""
 
 
+# ---- Option schema (v0.3) --------------------------------------------------
+
+_OPTION_TYPES = ("enum", "bool", "number", "string")
+
+
+@dataclass(frozen=True, slots=True)
+class OptionSpec:
+    """One configurable option for a CLI.
+
+    `argv` is the token list spliced into the spawn argv when the option is set;
+    every "{value}" placeholder is replaced by the chosen value's string form.
+    Argv tokens are NEVER shell-parsed.
+    """
+
+    name: str
+    type: str  # one of _OPTION_TYPES
+    argv: tuple[str, ...]
+    default: object = None
+    choices: tuple[object, ...] = ()
+    min: float | None = None
+    max: float | None = None
+    description: str = ""
+
+    def render_argv(self, value: object) -> tuple[str, ...]:
+        """Substitute {value} in the argv template with the chosen value."""
+        out: list[str] = []
+        for tok in self.argv:
+            if tok == "{value}":
+                out.append(str(value))
+            elif "{value}" in tok:
+                out.append(tok.replace("{value}", str(value)))
+            else:
+                out.append(tok)
+        return tuple(out)
+
+    def coerce_value(self, raw: object) -> object:
+        """Coerce a user-supplied value to the option's declared type and validate it."""
+        if self.type == "bool":
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                if raw.lower() in ("true", "1", "yes", "on"):
+                    return True
+                if raw.lower() in ("false", "0", "no", "off"):
+                    return False
+            raise RegistryError(f"option '{self.name}': bad bool {raw!r}")
+        if self.type == "number":
+            try:
+                num = float(raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise RegistryError(f"option '{self.name}': bad number {raw!r}") from exc
+            if self.min is not None and num < self.min:
+                raise RegistryError(f"option '{self.name}': {num} < min {self.min}")
+            if self.max is not None and num > self.max:
+                raise RegistryError(f"option '{self.name}': {num} > max {self.max}")
+            # If declared as integer-looking (no fractional in default/choices), prefer int
+            return int(num) if num.is_integer() else num
+        if self.type == "enum":
+            if raw not in self.choices:
+                raise RegistryError(
+                    f"option '{self.name}': {raw!r} not in choices {list(self.choices)}"
+                )
+            return raw
+        if self.type == "string":
+            return str(raw)
+        raise RegistryError(f"option '{self.name}': unknown type {self.type!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class CLIEntry:
     """One registered CLI."""
@@ -44,6 +112,7 @@ class CLIEntry:
     homepage: str = ""
     disabled: bool = False
     env: dict[str, str] = field(default_factory=dict)
+    options_schema: tuple[OptionSpec, ...] = ()
 
     @property
     def executable(self) -> str:
@@ -55,8 +124,76 @@ class CLIEntry:
             return False
         return shutil.which(self.executable) is not None
 
+    def option(self, name: str) -> OptionSpec | None:
+        for spec in self.options_schema:
+            if spec.name == name:
+                return spec
+        return None
+
 
 # ---- Loading ---------------------------------------------------------------
+
+
+def _parse_option(raw: object, cli_name: str, source: str) -> OptionSpec:
+    if not isinstance(raw, dict):
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option entry must be a table, "
+            f"got {type(raw).__name__}"
+        )
+
+    name = raw.get("name")
+    typ = raw.get("type")
+    argv = raw.get("argv")
+
+    if not isinstance(name, str) or not name:
+        raise RegistryError(f"{source}: cli '{cli_name}' has an option missing `name`")
+    if typ not in _OPTION_TYPES:
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' has invalid `type` {typ!r}; "
+            f"must be one of {_OPTION_TYPES}"
+        )
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' has invalid `argv` — "
+            "must be a non-empty list of strings"
+        )
+
+    choices_raw = raw.get("choices", [])
+    if not isinstance(choices_raw, list):
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' `choices` must be a list"
+        )
+    choices: tuple[object, ...] = tuple(choices_raw)
+
+    if typ == "enum" and len(choices) == 0:
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' is enum but has no `choices`"
+        )
+
+    default = raw.get("default")
+    if typ == "enum" and default is not None and default not in choices:
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' default {default!r} "
+            f"not in choices {list(choices)}"
+        )
+
+    min_v = raw.get("min")
+    max_v = raw.get("max")
+    if typ != "number" and (min_v is not None or max_v is not None):
+        raise RegistryError(
+            f"{source}: cli '{cli_name}' option '{name}' has min/max but type is {typ}, not number"
+        )
+
+    return OptionSpec(
+        name=name,
+        type=typ,
+        argv=tuple(argv),
+        default=default,
+        choices=choices,
+        min=float(min_v) if isinstance(min_v, (int, float)) else None,
+        max=float(max_v) if isinstance(max_v, (int, float)) else None,
+        description=str(raw.get("description", "")),
+    )
 
 
 def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
@@ -82,6 +219,22 @@ def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
     ):
         raise RegistryError(f"{source}: cli '{name}' has invalid `env` — must be str→str map")
 
+    opts_raw = raw.get("options_schema") or []
+    if not isinstance(opts_raw, list):
+        raise RegistryError(
+            f"{source}: cli '{name}' has invalid `options_schema` — must be a list of tables"
+        )
+    parsed_opts: list[OptionSpec] = []
+    seen_names: set[str] = set()
+    for entry in opts_raw:
+        spec = _parse_option(entry, name, source)
+        if spec.name in seen_names:
+            raise RegistryError(
+                f"{source}: cli '{name}' has duplicate option name {spec.name!r}"
+            )
+        seen_names.add(spec.name)
+        parsed_opts.append(spec)
+
     return CLIEntry(
         name=name,
         command=tuple(cmd),
@@ -92,6 +245,7 @@ def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
         homepage=str(raw.get("homepage", "")),
         disabled=bool(raw.get("disabled", False)),
         env={str(k): str(v) for k, v in env_raw.items()},
+        options_schema=tuple(parsed_opts),
     )
 
 

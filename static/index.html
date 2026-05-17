@@ -23,12 +23,13 @@
         id="project-dir"
         class="project-input"
         list="recent-projects"
-        placeholder="paste absolute path, drag a folder from Explorer, or pick from recents — blank = Council cwd"
+        placeholder="paste absolute path, drag a folder from Explorer, click Browse, or pick recent — blank = Council cwd"
         spellcheck="false"
         autocapitalize="off"
         autocomplete="off"
       />
       <datalist id="recent-projects"></datalist>
+      <button id="browse-folder" type="button" class="browse-btn" title="Open native folder picker">📂 Browse...</button>
       <span id="project-hint" class="project-hint muted">using Council cwd</span>
     </div>
   </header>
@@ -37,10 +38,7 @@
     <div class="prompt-area">
       <div class="control-row targets-row">
         <span class="control-label">targets:</span>
-        <label><input type="checkbox" data-cli="codex" checked /> codex</label>
-        <label><input type="checkbox" data-cli="claude" checked /> claude</label>
-        <label><input type="checkbox" data-cli="copilot" /> copilot</label>
-        <label><input type="checkbox" data-cli="gemini" /> gemini</label>
+        <div id="cli-cards-container" class="cli-cards"></div>
       </div>
       <div class="control-row execution-row">
         <span class="control-label">execution:</span>
@@ -60,17 +58,14 @@
         </label>
       </div>
       <textarea id="prompt-input" placeholder="Type your prompt (Ctrl+Enter to send)..." rows="6" spellcheck="false"></textarea>
-      <div id="run-status" class="run-status" role="status" aria-live="polite">
-        <span class="run-status-icon">●</span>
-        <span class="run-status-text" id="status-msg">ready</span>
-      </div>
+      <run-status-bar id="run-status"></run-status-bar>
       <div class="send-row">
         <button id="send-btn">Send to selected CLIs</button>
       </div>
     </div>
 
     <div class="panes" id="panes">
-      <!-- panes injected by app.js -->
+      <!-- <cli-pane> elements injected by app.js -->
     </div>
   </main>
 
@@ -109,6 +104,10 @@
     </form>
   </dialog>
 
+  <script type="module" src="/static/components/run-status-bar.js"></script>
+  <script type="module" src="/static/components/cli-card.js"></script>
+  <script type="module" src="/static/components/cli-pane.js"></script>
+  <script type="module" src="/static/components/options-popover.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

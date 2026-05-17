@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -147,6 +149,7 @@ async def stream_cli(
     label: str = "",
     *,
     cwd: Path | None = None,
+    options: dict[str, object] | None = None,
 ) -> str:
     """Spawn one CLI subprocess, stream its stdout/stderr line-by-line over WS.
 
@@ -171,7 +174,13 @@ async def stream_cli(
         await ws.send_json({"cli": cli, "kind": "error", "data": reason, "label": label})
         return ""
 
-    spec = build_spawn_spec(entry, prompt, cwd=cwd or ROOT)
+    try:
+        spec = build_spawn_spec(entry, prompt, cwd=cwd or ROOT, options=options)
+    except Exception as exc:
+        await ws.send_json(
+            {"cli": cli, "kind": "error", "data": f"option error: {exc}", "label": label}
+        )
+        return ""
     conv.write_event(
         {
             "kind": "cli_start",
@@ -179,6 +188,7 @@ async def stream_cli(
             "cmd": " ".join(spec.argv),
             "mode": spec.invocation_mode,
             "cwd": str(spec.cwd),
+            "options": dict(options or {}),
         }
     )
     proc = await spawn_subprocess(spec)
@@ -283,6 +293,18 @@ async def list_clis() -> dict[str, Any]:
                 "description": entry.description,
                 "homepage": entry.homepage,
                 "disabled": entry.disabled,
+                "options_schema": [
+                    {
+                        "name": opt.name,
+                        "type": opt.type,
+                        "default": opt.default,
+                        "choices": list(opt.choices),
+                        "min": opt.min,
+                        "max": opt.max,
+                        "description": opt.description,
+                    }
+                    for opt in entry.options_schema
+                ],
             }
             for entry in REGISTRY.values()
         }
@@ -371,6 +393,13 @@ async def get_conversation(conv_id: str) -> dict[str, Any]:
     d = CONVERSATIONS / conv_id
     if not d.exists():
         raise HTTPException(status_code=404, detail="not found")
+    manifest: dict[str, Any] = {}
+    mfile = d / "manifest.json"
+    if mfile.exists():
+        try:
+            manifest = json.loads(mfile.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
     prompt = (d / "prompt.md").read_text(encoding="utf-8") if (d / "prompt.md").exists() else ""
     responses = {}
     rdir = d / "responses"
@@ -378,7 +407,44 @@ async def get_conversation(conv_id: str) -> dict[str, Any]:
         for p in rdir.iterdir():
             if p.is_file():
                 responses[p.stem] = p.read_text(encoding="utf-8")
-    return {"id": conv_id, "prompt": prompt, "responses": responses}
+    return {"id": conv_id, "prompt": prompt, "responses": responses, "manifest": manifest}
+
+
+@app.post("/api/fs/pick-folder")
+async def pick_folder(payload: dict[str, str] | None = None) -> dict[str, Any]:
+    """Spawn the folder-picker helper in a short-lived subprocess.
+
+    Codex review explicitly required keeping tkinter out of the FastAPI request
+    thread (event-loop block + platform fragility), so we shell out to a helper.
+    """
+    helper = ROOT / "scripts" / "folder_picker_helper.py"
+    if not helper.exists():
+        raise HTTPException(status_code=500, detail="folder picker helper missing")
+    initial = (payload or {}).get("initial_dir", "") or os.path.expanduser("~")
+    title = (payload or {}).get("title", "") or "Choose project folder"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(helper),
+        initial,
+        title,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    out = stdout_b.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        try:
+            err_payload = json.loads(out) if out else {}
+        except json.JSONDecodeError:
+            err_payload = {}
+        stderr_text = stderr_b.decode("utf-8", errors="replace")
+        reason = err_payload.get("error") or stderr_text or "picker failed"
+        raise HTTPException(status_code=503, detail=str(reason))
+    try:
+        data = json.loads(out) if out else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"picker returned non-JSON: {exc}") from exc
+    return data
 
 
 @app.get("/api/modes")
@@ -408,6 +474,14 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             mode_name = msg.get("mode", "parallel")
             include_status = bool(msg.get("include_status", True))
             project_dir_raw = msg.get("project_dir") or ""
+            cli_options_raw = msg.get("cli_options") or {}
+            cli_options: dict[str, dict[str, object]] = {}
+            if isinstance(cli_options_raw, dict):
+                for cli_name, opts in cli_options_raw.items():
+                    if isinstance(cli_name, str) and isinstance(opts, dict):
+                        cli_options[cli_name] = {
+                            str(k): v for k, v in opts.items() if isinstance(k, str)
+                        }
             if not prompt:
                 await ws.send_json({"cli": "*", "kind": "error", "data": "empty prompt"})
                 continue
@@ -440,7 +514,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     "cwd": str(conv_cwd),
                 }
             )
-            # Persist per-conversation manifest (project_dir, selected_clis, mode).
+            # Persist per-conversation manifest (project_dir, selected_clis, mode, options).
             (conv.dir / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -448,6 +522,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                         "selected_clis": clis,
                         "mode": mode_name,
                         "include_status": include_status,
+                        "cli_options": cli_options,
                     },
                     indent=2,
                 ),
@@ -461,7 +536,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 }
             )
 
-            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd.
+            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options.
             # SOLE OWNER of status injection — stream_cli never re-injects.
             # Bind via default args to avoid B023 (loop-variable closure).
             async def run_cli_wrapped(
@@ -473,15 +548,21 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 *,
                 _inject: bool = include_status,
                 _cwd: Path = conv_cwd,
+                _opts: dict[str, dict[str, object]] = cli_options,
             ) -> str:
-                # Inject status on round 1 / initial only — packaged multi-round prompts
-                # from modes.py already contain the original task and would double-prepend.
-                # If `_inject` is False the user explicitly disabled it; respect that.
                 if label in ("", "r1") and _inject:
                     final_prompt = build_full_prompt(sub_prompt, include_status=True)
                 else:
                     final_prompt = sub_prompt
-                return await stream_cli(cli, final_prompt, ws_in, conv_in, label, cwd=_cwd)
+                return await stream_cli(
+                    cli,
+                    final_prompt,
+                    ws_in,
+                    conv_in,
+                    label,
+                    cwd=_cwd,
+                    options=_opts.get(cli),
+                )
 
             try:
                 result: ModeResult = await mode_fn(

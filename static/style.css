@@ -190,6 +190,147 @@ main {
   color: var(--warn);
 }
 
+/* ---- CLI cards (Web Component) ---- */
+
+.cli-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+cli-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.cli-card-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.cli-card-label.disabled {
+  color: var(--fg2);
+  text-decoration: line-through;
+  cursor: not-allowed;
+}
+
+.cli-card-label.experimental {
+  color: var(--warn);
+}
+
+.cli-card-badge {
+  font-size: 9px;
+  padding: 0 4px;
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  color: var(--warn);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-left: 2px;
+}
+
+.cli-card-gear {
+  background: transparent;
+  color: var(--fg2);
+  border: 0;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+}
+
+.cli-card-gear:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.cli-card-gear:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.cli-card-gear.has-overrides {
+  color: var(--accent);
+}
+
+/* ---- Options popover ---- */
+
+.options-popover-dialog {
+  background: var(--bg2);
+  color: var(--fg);
+  border: 1px solid var(--bg3);
+  border-radius: 8px;
+  padding: 20px;
+  max-width: 560px;
+  width: 80%;
+}
+
+.options-popover-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.options-popover-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: var(--accent);
+}
+
+.options-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.options-label {
+  color: var(--fg2);
+  text-align: right;
+}
+
+.options-input {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--bg3);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.options-desc {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--fg2);
+}
+
+.muted {
+  color: var(--fg2);
+  font-style: italic;
+}
+
+/* ---- Browse button ---- */
+
+.browse-btn {
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid #30363d;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.browse-btn:hover {
+  background: #30363d;
+}
+
 .mode-row {
   display: flex;
   align-items: center;

@@ -1,13 +1,14 @@
-// Council UI — WebSocket client for multi-CLI orchestration.
+// Council UI controller — state + WebSocket only, all rendering in custom elements.
 
-const CLIS = ["codex", "claude", "copilot", "gemini"];
 const RECENTS_KEY = "council:recent-project-dirs";
 const MAX_RECENTS = 5;
 
 const state = {
   convId: null,
   ws: null,
-  availableClis: {},
+  registry: {},      // {name: {available, options_schema, ...}}
+  selected: new Set(),
+  options: {},       // {cli_name: {opt_name: value}}
   inFlight: false,
 };
 
@@ -19,8 +20,6 @@ function setInFlight(value) {
     btn.textContent = value ? "Sending..." : "Send to selected CLIs";
   }
 }
-
-// ---- DOM utils ----
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -36,62 +35,14 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
-function buildPanes() {
-  const panes = document.getElementById("panes");
-  panes.innerHTML = "";
-  for (const cli of CLIS) {
-    const enabled = state.availableClis[cli]?.available;
-    const pane = el(
-      "div",
-      { className: "pane", "data-cli": cli },
-      el(
-        "div",
-        { className: "pane-head" },
-        el("span", { className: "pane-title" }, cli),
-        el("span", { className: enabled ? "pane-ok" : "pane-down" }, enabled ? "● ready" : "○ not installed"),
-        el(
-          "button",
-          {
-            className: "pane-clear",
-            onClick: () => {
-              pane.querySelector(".pane-body").textContent = "";
-              pane.classList.remove("pane-error");
-            },
-          },
-          "clear",
-        ),
-      ),
-      el("pre", { className: "pane-body" }),
-    );
-    panes.appendChild(pane);
-  }
-}
-
-function appendToPane(cli, kind, data) {
-  const paneEl = document.querySelector(`.pane[data-cli="${cli}"]`);
-  if (!paneEl) return;
-  const body = paneEl.querySelector(".pane-body");
-  const span = document.createElement("span");
-  span.className = `chunk-${kind}`;
-  span.textContent = data;
-  body.appendChild(span);
-  body.scrollTop = body.scrollHeight;
-  if (kind === "error") {
-    paneEl.classList.add("pane-error");
-    paneEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
-}
-
-function setRunStatus(kind, text) {
-  const wrap = document.getElementById("run-status");
-  const msg = document.getElementById("status-msg");
-  wrap.dataset.state = kind;
-  msg.textContent = text;
-}
+// ---- Status bar ----
 
 function appendStatus(text, klass = "info") {
+  const bar = document.getElementById("run-status");
   const stateMap = { error: "error", phase: "phase", info: "info" };
-  setRunStatus(stateMap[klass] || "info", text);
+  if (bar && typeof bar.set === "function") {
+    bar.set(stateMap[klass] || "info", text);
+  }
 }
 
 // ---- API ----
@@ -105,35 +56,64 @@ async function api(path, opts) {
   return res.json();
 }
 
+// ---- CLI cards + panes ----
+
+function renderCliCards() {
+  const container = document.getElementById("cli-cards-container");
+  if (!container) return;
+  container.innerHTML = "";
+  for (const [name, info] of Object.entries(state.registry)) {
+    const card = document.createElement("cli-card");
+    card.setAttribute("name", name);
+    card.setAttribute("available", String(Boolean(info.available)));
+    card.setAttribute("experimental", String(Boolean(info.experimental)));
+    card.setAttribute("selected", String(state.selected.has(name)));
+    card.schema = info.options_schema || [];
+    card.values = state.options[name] || {};
+    container.appendChild(card);
+  }
+}
+
+function renderPanes() {
+  const panes = document.getElementById("panes");
+  if (!panes) return;
+  panes.innerHTML = "";
+  for (const [name, info] of Object.entries(state.registry)) {
+    const pane = document.createElement("cli-pane");
+    pane.setAttribute("name", name);
+    pane.setAttribute("available", String(Boolean(info.available)));
+    panes.appendChild(pane);
+  }
+}
+
+function paneFor(name) {
+  return document.querySelector(`cli-pane[name="${CSS.escape(name)}"]`);
+}
+
+async function loadClis() {
+  const data = await api("/api/clis");
+  state.registry = data.clis || {};
+  // Auto-select codex + claude if available and nothing selected yet.
+  if (state.selected.size === 0) {
+    for (const seed of ["codex", "claude"]) {
+      if (state.registry[seed]?.available) state.selected.add(seed);
+    }
+  }
+  renderCliCards();
+  renderPanes();
+}
+
+// ---- Conversation ----
+
 async function newConversation() {
   const { id } = await api("/api/conversations", { method: "POST" });
   state.convId = id;
-  document.getElementById("conv-id-display").textContent = id;
-  document.getElementById("conv-id-display").classList.add("active");
+  const chip = document.getElementById("conv-id-display");
+  chip.textContent = id;
+  chip.classList.add("active");
   if (state.ws) state.ws.close();
   state.ws = new WebSocket(`ws://${location.host}/ws/${id}`);
-  state.ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.cli === "*") {
-      if (m.kind === "trust_required") {
-        setInFlight(false);
-        document.getElementById("trust-target").textContent = m.data;
-        document.getElementById("trust-reason").textContent = m.reason || "needs approval";
-        const dlg = document.getElementById("trust-dialog");
-        const btn = document.getElementById("trust-approve");
-        btn.onclick = () => approveTrust(m.data);
-        dlg.showModal();
-        return;
-      }
-      if (m.kind === "batch_done" || m.kind === "error") {
-        setInFlight(false);
-      }
-      appendStatus(`[${m.kind}] ${m.data}`, m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info");
-      return;
-    }
-    const tag = m.label ? `[${m.label}] ` : "";
-    appendToPane(m.cli, m.kind, tag + m.data);
-  };
+  state.ws.onmessage = onWsMessage;
   state.ws.onclose = () => appendStatus("ws closed", "info");
   state.ws.onerror = () => appendStatus("ws error", "error");
   await new Promise((resolve) => {
@@ -144,26 +124,34 @@ async function newConversation() {
   });
 }
 
-async function loadClis() {
-  const data = await api("/api/clis");
-  state.availableClis = data.clis;
-  for (const cb of document.querySelectorAll("input[data-cli]")) {
-    const name = cb.dataset.cli;
-    const avail = state.availableClis[name]?.available;
-    if (!avail) {
-      cb.checked = false;
-      cb.disabled = true;
-      cb.parentElement.title = "not installed locally";
-      cb.parentElement.classList.add("disabled");
+function onWsMessage(ev) {
+  const m = JSON.parse(ev.data);
+  if (m.cli === "*") {
+    if (m.kind === "trust_required") {
+      setInFlight(false);
+      document.getElementById("trust-target").textContent = m.data;
+      document.getElementById("trust-reason").textContent = m.reason || "needs approval";
+      const dlg = document.getElementById("trust-dialog");
+      const btn = document.getElementById("trust-approve");
+      btn.onclick = () => approveTrust(m.data);
+      dlg.showModal();
+      return;
     }
+    if (m.kind === "batch_done" || m.kind === "error") {
+      setInFlight(false);
+    }
+    appendStatus(
+      `[${m.kind}] ${m.data}`,
+      m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info",
+    );
+    return;
   }
+  const tag = m.label ? `[${m.label}] ` : "";
+  const pane = paneFor(m.cli);
+  if (pane) pane.appendChunk(m.kind, tag + m.data);
 }
 
-function getSelectedClis() {
-  return [...document.querySelectorAll("input[data-cli]:checked")].map(
-    (cb) => cb.dataset.cli,
-  );
-}
+// ---- Send ----
 
 async function send() {
   if (state.inFlight) {
@@ -179,7 +167,7 @@ async function send() {
     appendStatus("empty prompt", "error");
     return;
   }
-  const clis = getSelectedClis();
+  const clis = [...state.selected];
   if (clis.length === 0) {
     appendStatus("select at least one CLI", "error");
     return;
@@ -192,8 +180,14 @@ async function send() {
     saveRecentDir(projectDir);
   }
   setInFlight(true);
-  for (const p of document.querySelectorAll(".pane.pane-error")) {
-    p.classList.remove("pane-error");
+  for (const p of document.querySelectorAll("cli-pane.pane-error")) {
+    p.markOk();
+  }
+  const cliOptions = {};
+  for (const name of clis) {
+    if (state.options[name] && Object.keys(state.options[name]).length > 0) {
+      cliOptions[name] = state.options[name];
+    }
   }
   state.ws.send(
     JSON.stringify({
@@ -203,6 +197,7 @@ async function send() {
       mode,
       include_status: includeStatus,
       project_dir: projectDir,
+      cli_options: cliOptions,
     }),
   );
   appendStatus(`mode=${mode} → ${clis.join(", ")} (cwd=${projectDir || "council"})`, "phase");
@@ -218,24 +213,29 @@ async function openTrustList() {
     list.appendChild(el("li", { className: "muted" }, "no trusted folders yet"));
   } else {
     for (const path of data.trusted) {
-      const item = el(
-        "li",
-        {},
-        el("code", {}, path),
-        " ",
-        el("button", {
-          className: "trust-revoke",
-          onClick: async (e) => {
-            e.preventDefault();
-            await api("/api/trust/revoke", {
-              method: "POST",
-              body: JSON.stringify({ project_dir: path, note: "" }),
-            });
-            openTrustList();
-          },
-        }, "revoke"),
+      list.appendChild(
+        el(
+          "li",
+          {},
+          el("code", {}, path),
+          " ",
+          el(
+            "button",
+            {
+              className: "trust-revoke",
+              onClick: async (e) => {
+                e.preventDefault();
+                await api("/api/trust/revoke", {
+                  method: "POST",
+                  body: JSON.stringify({ project_dir: path, note: "" }),
+                });
+                openTrustList();
+              },
+            },
+            "revoke",
+          ),
+        ),
       );
-      list.appendChild(item);
     }
   }
   document.getElementById("trust-list-dialog").showModal();
@@ -273,7 +273,7 @@ async function saveStatus() {
   document.getElementById("status-dialog").close();
 }
 
-// ---- Recent project dirs ----
+// ---- Project folder helpers ----
 
 function loadRecentDirs() {
   try {
@@ -355,12 +355,32 @@ function updateProjectHint() {
   }
 }
 
+async function pickFolder() {
+  const initial = document.getElementById("project-dir").value.trim();
+  try {
+    const data = await api("/api/fs/pick-folder", {
+      method: "POST",
+      body: JSON.stringify({ initial_dir: initial }),
+    });
+    if (data.cancelled) {
+      appendStatus("folder picker cancelled", "info");
+      return;
+    }
+    if (data.path) {
+      document.getElementById("project-dir").value = data.path;
+      saveRecentDir(data.path);
+      updateProjectHint();
+      appendStatus(`picked: ${data.path}`, "info");
+    }
+  } catch (err) {
+    appendStatus(`picker failed: ${err.message}`, "error");
+  }
+}
+
 // ---- Init ----
 
 window.addEventListener("DOMContentLoaded", async () => {
-  buildPanes();
   await loadClis();
-  buildPanes();
 
   const lastProjectDir = localStorage.getItem("council:last-project-dir");
   if (lastProjectDir) document.getElementById("project-dir").value = lastProjectDir;
@@ -374,6 +394,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("open-status").addEventListener("click", openStatus);
   document.getElementById("save-status").addEventListener("click", saveStatus);
   document.getElementById("trust-list").addEventListener("click", openTrustList);
+  document.getElementById("browse-folder").addEventListener("click", pickFolder);
+
+  // Listen for component events
+  document.addEventListener("cli-card:toggle", (e) => {
+    const { name, selected } = e.detail;
+    if (selected) state.selected.add(name);
+    else state.selected.delete(name);
+  });
+  document.addEventListener("cli-card:options", (e) => {
+    const { name, options } = e.detail;
+    state.options[name] = options;
+  });
 
   document.getElementById("prompt-input").addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") send();
