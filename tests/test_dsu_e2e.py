@@ -104,13 +104,16 @@ def _read_cli_starts(conv_id: str) -> list[dict]:
     return starts
 
 
-def _read_response(conv_id: str, cli: str) -> str:
+def _read_response(conv_id: str, cli: str, *, label: str | None = None) -> str:
     """Read what the fake CLI captured as its stdout.
 
     Parallel mode passes `label="r1"` for symmetry with multi-round modes, so
-    the file lands at `responses/{cli}__r1.md`. We pick the most-recently-
-    modified file matching `{cli}*.md` so the caller doesn't have to know
-    the mode's internal labeling convention.
+    the file lands at `responses/{cli}__r1.md`. By default we pick the most-
+    recently-modified file matching `{cli}*.md` so the caller doesn't have to
+    know the mode's internal labeling convention.
+
+    Pass an explicit `label` to read a specific labeled file, e.g.
+    `_read_response(cid, "fake-a", label="draft")` for cascade's drafter call.
 
     fake_cli echoes the incoming prompt verbatim with `[name] | <line>` per
     line, so DSU blocks and full prompt structure are visible in the returned
@@ -119,6 +122,9 @@ def _read_response(conv_id: str, cli: str) -> str:
     dir_path = server.CONVERSATIONS / conv_id / "responses"
     if not dir_path.exists():
         return ""
+    if label is not None:
+        path = dir_path / f"{cli}__{label}.md"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
     matches = sorted(
         dir_path.glob(f"{cli}*.md"),
         key=lambda p: p.stat().st_mtime,
@@ -387,3 +393,81 @@ def test_dsu_armed_event_emitted(client) -> None:
         msg = ws.receive_json()
         assert msg["kind"] == "dsu_armed"
         assert "queued" in msg["data"].lower() or "DSU" in msg["data"]
+
+
+# ---- Codex bot v0.5 P2 #2: rc tracking + peer_log error flag ---------------
+
+
+def test_peer_log_marks_nonzero_rc_as_error(client, monkeypatch) -> None:
+    """A CLI that emits stdout then exits non-zero must land in peer_log with
+    error=true. Pre-fix the rc was only in events.jsonl; peer_log only flagged
+    the synthetic `[error: ...]` strings from asyncio.gather exceptions.
+    """
+    # fake_cli with FAKE_CLI_FAIL=1 prints to stderr and exits 1 — it does NOT
+    # print to stdout, so this catches the basic case. The richer "stdout +
+    # nonzero exit" case isn't easy to simulate with fake_cli without rewriting
+    # it; the rc-based check covers both.
+    fail_entry = CLIEntry(
+        name="fake-a",
+        command=(PYTHON, str(FAKE_HELPER), "{prompt}"),
+        invocation_mode="argv",
+        env={"FAKE_CLI_NAME": "fake-a", "FAKE_CLI_FAIL": "1"},
+        resume_command=(PYTHON, str(FAKE_HELPER), "--resume", "{session_id}", "{prompt}"),
+        session_id_pattern=r"session_id:\s*([A-Za-z0-9]+)",
+    )
+    monkeypatch.setattr(server, "REGISTRY", {"fake-a": fail_entry})
+
+    r = client.post("/api/conversations")
+    conv_id = r.json()["id"]
+    with client.websocket_connect(f"/ws/{conv_id}") as ws:
+        _send(ws, prompt="will fail", clis=["fake-a"])
+        _collect_until(ws, kind="batch_done", cli="*")
+
+    log_path = server.CONVERSATIONS / conv_id / "peer_log.jsonl"
+    assert log_path.exists()
+    entries = [json.loads(line) for line in log_path.read_text().strip().splitlines()]
+    assert len(entries) == 1
+    # The CLI exited rc=1 — must be flagged regardless of text content.
+    assert entries[0]["error"] is True, (
+        f"non-zero rc CLI should be error=true: {entries[0]}"
+    )
+
+
+# ---- Codex bot v0.5 P2 #3: DSU injects on first-call across all modes ------
+
+
+def test_dsu_injects_on_first_call_in_cascade_mode(client, monkeypatch) -> None:
+    """Cascade mode's first call to the drafter uses label='draft' (not
+    'r1'/''). Pre-fix the DSU block was skipped because of hardcoded label
+    list. Now we track first-call per CLI via `_dsu_emitted_to`.
+    """
+    # Cascade needs 3 CLIs (drafter, critic, validator). Add fake-c.
+    monkeypatch.setitem(server.REGISTRY, "fake-c", _fake_entry("fake-c"))
+    r = client.post("/api/conversations")
+    conv_id = r.json()["id"]
+
+    with client.websocket_connect(f"/ws/{conv_id}") as ws:
+        ws.send_json({"action": "set_peer_sync", "mode": "dsu", "budget_tokens": 64})
+        ws.receive_json()
+        _send(ws, prompt="turn one", clis=["fake-a", "fake-b", "fake-c"], mode="cascade")
+        _collect_until(ws, kind="batch_done", cli="*")
+        ws.send_json({"action": "dsu_load"})
+        ws.receive_json()
+        _send(ws, prompt="turn two", clis=["fake-a", "fake-b", "fake-c"], mode="cascade")
+        _collect_until(ws, kind="batch_done", cli="*")
+
+    # Cascade calls fake-a twice (drafter then reviser). Pre-fix the DSU was
+    # gated by label in ("", "r1"), so neither call got DSU. Post-fix the
+    # FIRST call per CLI gets it regardless of mode-specific label.
+    resp_a_draft = _read_response(conv_id, "fake-a", label="draft")
+    resp_a_revise = _read_response(conv_id, "fake-a", label="revise")
+    # The drafter call (fake-a's first call) MUST have DSU.
+    assert "COUNCIL_DSU_START" in resp_a_draft, (
+        f"DSU missing in cascade's first call to fake-a (label='draft'): "
+        f"{resp_a_draft[:500]}"
+    )
+    # The reviser call (fake-a's second call) should NOT — within-mode peer
+    # packing already conveys peer info on subsequent rounds.
+    assert "COUNCIL_DSU_START" not in resp_a_revise, (
+        f"DSU should be on FIRST call only, not reviser: {resp_a_revise[:500]}"
+    )

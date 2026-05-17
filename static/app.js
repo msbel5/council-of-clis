@@ -10,6 +10,10 @@ const state = {
   selected: new Set(),
   options: {},       // {cli_name: {opt_name: value}}
   inFlight: false,
+  // v0.5: peer-sync selection captured before a WS opens (Codex bot P2 #1).
+  // Replayed via /set_peer_sync as soon as the WS is established so the user's
+  // pre-conversation choice isn't silently dropped.
+  pendingPeerSyncMode: null,
 };
 
 function setInFlight(value) {
@@ -119,6 +123,22 @@ async function newConversation() {
   await new Promise((resolve) => {
     state.ws.onopen = () => {
       appendStatus(`conversation ${id} ready`, "info");
+      // Replay any pending peer-sync selection from before this WS existed
+      // (Codex bot P2 #1 fix). Also re-emits the current dropdown value if
+      // it differs from default 'off' — so a user who set 'dsu' in the UI
+      // before clicking "New conversation" still ends up with dsu applied.
+      const sel = document.getElementById("peer-sync-mode");
+      const desired = state.pendingPeerSyncMode || (sel && sel.value);
+      if (desired && desired !== "off") {
+        state.ws.send(
+          JSON.stringify({
+            action: "set_peer_sync",
+            mode: desired,
+            budget_tokens: 64,
+          }),
+        );
+        state.pendingPeerSyncMode = null;
+      }
       resolve();
     };
   });
@@ -390,7 +410,12 @@ function dsuLoad() {
 function setPeerSync() {
   const sel = document.getElementById("peer-sync-mode");
   if (!state.ws || state.ws.readyState !== 1) {
-    appendStatus("no active conversation — change applied on next start", "info");
+    // Stash the choice; replay it when the WS opens (Codex bot P2 #1).
+    state.pendingPeerSyncMode = sel.value;
+    appendStatus(
+      `peer-sync queued: ${sel.value} (applies when a conversation opens)`,
+      "info",
+    );
     return;
   }
   state.ws.send(

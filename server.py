@@ -161,6 +161,16 @@ class Conversation:
         # cleared at the end of that send. Lives in-memory only (per-process
         # Conversation singleton via get_or_create) since it's transient state.
         self._dsu_pending = False
+        # v0.5: per-send rc record keyed by cli; reset at start of each send.
+        # Codex bot P2: a CLI that emits stdout then exits non-zero would
+        # otherwise be persisted to peer_log with error=false and pollute the
+        # next DSU. stream_cli writes here; ws_stream reads after mode_fn.
+        self._last_rcs: dict[str, int] = {}
+        # v0.5: per-send tracking of which CLIs have already received a DSU
+        # injection in run_cli_wrapped — so DSU lands on the FIRST call per CLI
+        # regardless of mode-specific label (cascade uses "draft", moa uses
+        # "prop_r1", router uses "classify"/"answer", parallel/debate use "r1").
+        self._dsu_emitted_to: set[str] = set()
 
     def write_event(self, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
@@ -398,6 +408,11 @@ async def stream_cli(
         captured_session_id = extract_session_id(entry, full_response)
         if captured_session_id:
             await conv.set_cli_session(cli, captured_session_id)
+        # v0.5 Codex bot P2: record rc per CLI for THIS send so peer_log can
+        # mark entries with error=true when the CLI exited non-zero, even if
+        # it emitted stdout before failing. Stream_cli is the only place rc
+        # is known; we stash it on conv for the post-mode_fn peer_log write.
+        conv._last_rcs[cli] = rc
         conv.write_event(
             {
                 "kind": "cli_done",
@@ -764,6 +779,15 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             # (not per spawn) so all CLIs in this send agree on what they're resuming.
             cli_sessions = conv.load_cli_sessions()
 
+            # v0.5: reset per-send state — rc tracking + DSU-emitted set. The
+            # rc tracking lets us mark peer_log entries as error=true when a
+            # CLI exited non-zero (Codex bot P2 #2). The emitted-to set lets
+            # DSU land on the FIRST run_cli call per CLI regardless of mode
+            # label (Codex bot P2 #3): cascade uses "draft", moa uses "prop_r1",
+            # router uses "classify"/"answer", parallel/debate use "r1".
+            conv._last_rcs = {}
+            conv._dsu_emitted_to = set()
+
             # v0.5 DSU: if the user armed a peer brief AND peer_sync_mode == "dsu",
             # render the brief ONCE here per receiver. The block is per-receiver
             # because each CLI gets a version with its OWN entry filtered out
@@ -806,10 +830,16 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 _sessions: dict[str, str] = cli_sessions,
                 _dsu_blocks: dict[str, str] = dsu_blocks,
             ) -> str:
-                # DSU block only on the FIRST round (label=="" or "r1") — within-mode
-                # rounds already pack peers via mode helpers, no need to double-state.
-                dsu = _dsu_blocks.get(cli, "") if label in ("", "r1") else ""
-                if label in ("", "r1") and (_inject or dsu):
+                # Codex bot P2 #3: DSU + status injection on the FIRST run_cli
+                # call per CLI in this send, regardless of mode-specific label.
+                # `conv._dsu_emitted_to` is reset at the start of each send and
+                # tracks which CLIs have already received their injection. Within-
+                # mode subsequent rounds (debate r2, cascade critique, etc.)
+                # already pack peers via mode helpers, so no double-state.
+                is_first_call = cli not in conv_in._dsu_emitted_to
+                dsu = _dsu_blocks.get(cli, "") if is_first_call else ""
+                if is_first_call:
+                    conv_in._dsu_emitted_to.add(cli)
                     final_prompt = build_full_prompt(
                         sub_prompt, include_status=_inject, dsu_block=dsu
                     )
@@ -847,6 +877,13 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 # CLI's FINAL per-send response (last element of its history).
                 # `from_response` strips any embedded COUNCIL_DSU_* markers so a
                 # CLI that quoted the previous turn's brief doesn't recurse.
+                #
+                # Codex bot P2 #2: error=true if EITHER the history holds a
+                # synthetic "[error: ...]" string (asyncio.gather exception) OR
+                # the subprocess exited non-zero (recorded in `_last_rcs` by
+                # stream_cli). The first catches mode-level failures; the second
+                # catches CLIs that printed stdout then failed — which would
+                # otherwise poison the next DSU with partial/error output.
                 turn_no = current_turn  # captured above before mode_fn ran
                 peer_entries: list[PeerLogEntry] = []
                 for cli_name, history in result["per_cli_history"].items():
@@ -855,7 +892,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     final_text = history[-1]
                     is_error = bool(
                         isinstance(final_text, str) and final_text.startswith("[error:")
-                    )
+                    ) or (conv._last_rcs.get(cli_name, 0) != 0)
                     peer_entries.append(
                         PeerLogEntry.from_response(
                             turn=turn_no,
