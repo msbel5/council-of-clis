@@ -37,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import trust
-from dsu import build_dsu_block
+from dsu import build_dsu_block, strip_dsu_markers
 from modes import MODES, ModeResult
 from peer_log import PeerLogEntry, append_entries, latest_per_cli
 from registry import CLIEntry, ensure_user_config_seeded, load_registry
@@ -845,7 +845,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     )
                 else:
                     final_prompt = sub_prompt
-                return await stream_cli(
+                raw = await stream_cli(
                     cli,
                     final_prompt,
                     ws_in,
@@ -855,6 +855,16 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     options=_opts.get(cli),
                     session_id=_sessions.get(cli),
                 )
+                # Strip DSU markers from the response BEFORE the mode helpers
+                # (pack_for_revision etc.) quote it into the next round's prompt.
+                # If we don't strip here, cascade's reviser would receive the
+                # drafter's response WITH the DSU block we injected on the
+                # drafter's first call — and quote it verbatim into the
+                # reviser's prompt, which then propagates to the validator etc.
+                # Persisted artifacts (`responses/<cli>__<label>.md`, peer_log)
+                # keep the raw text — only the value FED BACK INTO the mode
+                # pipeline is cleaned.
+                return strip_dsu_markers(raw)
 
             try:
                 result: ModeResult = await mode_fn(
