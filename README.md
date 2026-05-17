@@ -57,6 +57,10 @@ pip install -e ".[dev]"
 python server.py
 ```
 
+> **macOS note**: the "Choose folder" button uses Tk via Python's stdlib `tkinter`. If
+> you installed Python via Homebrew you may also need `brew install python-tk@3.12`
+> (or matching minor version). Drag-and-drop and pasted paths work without Tk.
+
 ## CLI requirements
 
 Council shells out to whichever CLIs you have installed. Missing ones are auto-disabled in the UI.

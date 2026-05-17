@@ -27,6 +27,15 @@ TRUST_STORE = USER_CONFIG_DIR / "trusted_folders.json"
 # System paths that can NEVER be a project_dir, regardless of user trust.
 # `EXACT` blocks only the literal path. `DESCENDANTS` blocks the path and everything under it.
 # (Root `/` and `C:/` go in EXACT — every other path is under root, so we can't blanket-block.)
+#
+# macOS-specific notes:
+# - `/Library` and `/System` are SIP-protected; we block descendants anyway so a
+#   slip-up doesn't cause a CLI to chdir into kext territory.
+# - `/private` is the real backing for `/etc`, `/var`, `/tmp` on macOS — blocking it
+#   prevents accidents like `Path("/private/var/log").resolve()` ending up under
+#   the descendants list via canonicalization but being spawned-into directly.
+# - `/opt/homebrew` is the Apple Silicon Homebrew prefix; never run a CLI inside
+#   the package manager's own tree.
 _FORBIDDEN_EXACT_POSIX = (Path("/"),)
 _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/etc"),
@@ -39,6 +48,8 @@ _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/var/log"),
     Path("/Library"),
     Path("/System"),
+    Path("/private"),
+    Path("/opt/homebrew"),
 )
 _FORBIDDEN_EXACT_WIN = (Path("C:/"), Path("C:\\"))
 _FORBIDDEN_DESCENDANTS_WIN = (
@@ -75,13 +86,20 @@ def _forbidden_descendants() -> tuple[Path, ...]:
 
 
 def _is_under(child: Path, parent: Path) -> bool:
-    """True if `child` is `parent` or any descendant. Case-insensitive on Windows."""
+    """True if `child` is `parent` or any descendant.
+
+    Case-insensitive on Windows (NTFS) and macOS (APFS default). Most macOS
+    installs are case-insensitive APFS; the rare case-sensitive APFS variant
+    just loses the "auto-block" for misspelled-case system paths — the user
+    will still see the trust prompt and approve/decline manually, so we don't
+    relax safety, only ergonomics.
+    """
     try:
         child_resolved = child.resolve(strict=False)
         parent_resolved = parent.resolve(strict=False)
     except OSError:
         return False
-    if sys.platform.startswith("win"):
+    if sys.platform.startswith("win") or sys.platform == "darwin":
         c = str(child_resolved).lower()
         p = str(parent_resolved).lower()
         return c == p or c.startswith(p + os.sep.lower()) or c.startswith(p + "/")

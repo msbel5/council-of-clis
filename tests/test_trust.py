@@ -55,6 +55,28 @@ def test_forbidden_root_blocked_on_posix() -> None:
     assert is_forbidden(Path("/etc/passwd").parent) is not None
 
 
+def test_forbidden_root_blocked_on_macos() -> None:
+    """macOS adds /private, /opt/homebrew, /Library, /System to the descendants list."""
+    if sys.platform != "darwin":
+        pytest.skip("macOS-only check")
+    # macOS-specific paths that should be blocked
+    assert is_forbidden(Path("/Library")) is not None
+    assert is_forbidden(Path("/Library/LaunchAgents")) is not None
+    assert is_forbidden(Path("/System")) is not None
+    assert is_forbidden(Path("/System/Library/Frameworks")) is not None
+    assert is_forbidden(Path("/private")) is not None
+    assert is_forbidden(Path("/private/var/log")) is not None
+    # Apple Silicon Homebrew prefix
+    assert is_forbidden(Path("/opt/homebrew")) is not None
+    assert is_forbidden(Path("/opt/homebrew/bin")) is not None
+    # Case-insensitive on default APFS
+    assert is_forbidden(Path("/library")) is not None
+    assert is_forbidden(Path("/SYSTEM")) is not None
+    # User home / typical project locations are NOT blocked
+    assert is_forbidden(Path("/Users/test/code")) is None
+    assert is_forbidden(Path("/Applications")) is None  # Allowed — user repos OK
+
+
 def test_forbidden_root_blocked_on_windows() -> None:
     if not sys.platform.startswith("win"):
         pytest.skip("windows-only check")

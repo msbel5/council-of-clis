@@ -3,10 +3,16 @@
 Single FastAPI + uvicorn process. Spawns codex / claude / copilot / gemini subprocesses
 in parallel, streams their stdout line-by-line over WebSocket to the browser UI.
 
-Run:
-    cd C:\\Users\\msbel\\alcyone-project\\council
+Run (Windows PowerShell):
+    cd <path-to-council-repo>
     uv venv && .\\.venv\\Scripts\\Activate.ps1
-    uv pip install fastapi "uvicorn[standard]" pydantic
+    uv pip install fastapi "uvicorn[standard]" pydantic platformdirs
+    python server.py
+
+Run (macOS/Linux):
+    cd <path-to-council-repo>
+    uv venv && source .venv/bin/activate
+    uv pip install fastapi "uvicorn[standard]" pydantic platformdirs
     python server.py
 
 Then open http://localhost:8765

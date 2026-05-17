@@ -196,19 +196,37 @@ def extract_session_id(entry: CLIEntry, captured_stdout: str) -> str | None:
 
     Returns None if the CLI doesn't declare a pattern, or if no match was found.
     The pattern must have exactly one capture group — the session id itself.
+
+    Two defenses against an attacker- or model-controlled response poisoning the
+    saved session id (Codex bot P2 fix):
+
+    1. **Scan only the tail** of stdout. Real CLIs print their session marker as
+       a footer after model content, so a 4 KB tail is more than enough to catch
+       it while excluding most of the model's prose.
+    2. **Pick the LAST match**, not the first. If the model talks about session
+       IDs in its answer (e.g. quoting docs), the CLI's footer still comes
+       last in stdout order. ``re.findall`` returns the captured groups in
+       order; ``[-1]`` is the rightmost (most recent) one.
+
+    Neither defense is bulletproof, but together they make accidental capture
+    of a value the model emitted vanishingly unlikely without breaking any
+    documented CLI footer format.
     """
     if not entry.session_id_pattern:
         return None
     import re
 
-    match = re.search(entry.session_id_pattern, captured_stdout)
-    if match is None:
+    # Tail-only scan. 4 KB is plenty for known CLI footers (uuid + a few lines).
+    tail = captured_stdout[-4096:] if len(captured_stdout) > 4096 else captured_stdout
+    matches = re.findall(entry.session_id_pattern, tail)
+    if not matches:
         return None
-    try:
-        return match.group(1)
-    except IndexError:
-        # Pattern compiled but has no capture group — treat as no match.
-        return None
+    last = matches[-1]
+    # `re.findall` returns either a list of strings (1 group) or list of tuples
+    # (≥2 groups). We validate one-group-only at load time, but defend anyway.
+    if isinstance(last, tuple):
+        last = last[0] if last else ""
+    return last or None
 
 
 __all__ = [

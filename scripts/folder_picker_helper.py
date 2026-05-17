@@ -46,7 +46,12 @@ def main() -> int:
 
     try:
         root.withdraw()
+        # macOS-specific: a withdrawn Tk root won't bring the askdirectory dialog
+        # to the front; `update_idletasks` + `lift` makes the dialog appear above
+        # the calling terminal app reliably. Harmless on other platforms.
         with suppress(tk.TclError):
+            root.update_idletasks()
+            root.lift()
             # Some Linux WMs don't support -topmost; ignore.
             root.attributes("-topmost", True)
         picked = filedialog.askdirectory(
