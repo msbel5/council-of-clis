@@ -131,6 +131,12 @@ class Conversation:
         (self.dir / "responses").mkdir(exist_ok=True)
         self.log_path = self.dir / "events.jsonl"
         self.sessions_path = self.dir / "cli_sessions.json"
+        # Serializes concurrent set_cli_session() in parallel modes — Codex bot
+        # P2 v0.4: two CLIs finishing at the same moment would each read the
+        # store, modify in-memory, and write — the loser's write overwrote the
+        # winner's session id. Single lock per Conversation keeps the
+        # load → modify → write atomic from the event loop's perspective.
+        self._sessions_lock = asyncio.Lock()
 
     def write_event(self, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
@@ -155,13 +161,20 @@ class Conversation:
             return {}
         return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
 
-    def set_cli_session(self, cli: str, session_id: str) -> None:
-        """Persist a CLI's session id for future turns."""
-        store = self.load_cli_sessions()
-        store[cli] = session_id
-        self.sessions_path.write_text(
-            json.dumps(store, indent=2, sort_keys=True), encoding="utf-8"
-        )
+    async def set_cli_session(self, cli: str, session_id: str) -> None:
+        """Persist a CLI's session id for future turns.
+
+        Async + lock-guarded so parallel CLIs that finish at the same moment
+        can't lose one another's session ids in a read-modify-write race
+        (Codex bot v0.4 P2). One Conversation instance = one lock, so each
+        write reads the latest on-disk state under exclusion.
+        """
+        async with self._sessions_lock:
+            store = self.load_cli_sessions()
+            store[cli] = session_id
+            self.sessions_path.write_text(
+                json.dumps(store, indent=2, sort_keys=True), encoding="utf-8"
+            )
 
     @classmethod
     def new(cls) -> Conversation:
@@ -271,7 +284,7 @@ async def stream_cli(
         # Extract session id from output if the CLI supports resumption.
         captured_session_id = extract_session_id(entry, full_response)
         if captured_session_id:
-            conv.set_cli_session(cli, captured_session_id)
+            await conv.set_cli_session(cli, captured_session_id)
         conv.write_event(
             {
                 "kind": "cli_done",
