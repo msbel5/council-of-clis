@@ -176,10 +176,9 @@ def test_dsu_inject_on_next_send_excludes_self(client) -> None:
     if not resp_a or "COUNCIL_DSU_START" not in resp_a:
         conv_dir = server.CONVERSATIONS / conv_id
         responses_dir = conv_dir / "responses"
-        if responses_dir.exists():
-            files_in_responses = list(responses_dir.iterdir())
-        else:
-            files_in_responses = []
+        files_in_responses = (
+            list(responses_dir.iterdir()) if responses_dir.exists() else []
+        )
         events_text = (
             (conv_dir / "events.jsonl").read_text(encoding="utf-8")
             if (conv_dir / "events.jsonl").exists()
