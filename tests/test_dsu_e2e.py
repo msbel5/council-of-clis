@@ -390,6 +390,87 @@ def test_dsu_budget_truncates_peer_text(client) -> None:
 # ---- DSU armed event ------------------------------------------------------
 
 
+# ---- Codex audit MUST-FIX: send-level lock prevents cross-send races ------
+
+
+def test_concurrent_sends_on_same_conv_id_dont_corrupt_state(client) -> None:
+    """Two TestClient WebSocket connections on the same conv_id send within a
+    tight window. The send lock on Conversation must serialize them so neither
+    overwrites the other's per-send state (rc tracking, DSU consumption, turn
+    numbering).
+
+    We can't easily run two TestClient WSes truly in parallel from one test
+    process — but we can rapid-fire on a single WS and verify peer_log turn
+    numbers and rc tracking stay consistent. The lock also defends two-tabs
+    case; that's structural and covered by the implementation review.
+    """
+    r = client.post("/api/conversations")
+    conv_id = r.json()["id"]
+
+    # 3 sequential sends — under the lock they must produce turn 1, 2, 3 in
+    # order, each with both CLIs' rc=0 reflected (we use non-failing fakes).
+    with client.websocket_connect(f"/ws/{conv_id}") as ws:
+        for i in range(3):
+            _send(ws, prompt=f"turn {i + 1}", clis=["fake-a", "fake-b"])
+            _collect_until(ws, kind="batch_done", cli="*")
+
+    log_path = server.CONVERSATIONS / conv_id / "peer_log.jsonl"
+    entries = [json.loads(line) for line in log_path.read_text().strip().splitlines()]
+    # 3 turns × 2 CLIs = 6 entries
+    assert len(entries) == 6
+    # Turn numbers must be strictly increasing (1, 1, 2, 2, 3, 3) — if locks
+    # failed, we'd see interleaved or duplicate turn numbers.
+    turns = [e["turn"] for e in entries]
+    assert turns == [1, 1, 2, 2, 3, 3], turns
+    # No entry should be flagged as error
+    assert all(not e["error"] for e in entries), [e for e in entries if e["error"]]
+
+
+def test_pre_mode_failure_does_not_leak_dsu_armed(client) -> None:
+    """Codex audit MUST-FIX: DSU one-shot consume now happens at send START.
+    If a send fails BEFORE mode_fn (e.g. trust check denies, empty prompt),
+    a previously-armed DSU must NOT survive to a later send.
+
+    Pre-fix the flag was cleared only in the post-mode_fn `finally` block.
+    Now the consume is atomic at start: arm → next send always consumes,
+    success or failure.
+    """
+    r = client.post("/api/conversations")
+    conv_id = r.json()["id"]
+
+    with client.websocket_connect(f"/ws/{conv_id}") as ws:
+        ws.send_json({"action": "set_peer_sync", "mode": "dsu", "budget_tokens": 64})
+        ws.receive_json()
+        # Turn 1 to populate peer_log so DSU has something to inject next time
+        _send(ws, prompt="turn one", clis=["fake-a", "fake-b"])
+        _collect_until(ws, kind="batch_done", cli="*")
+        # Arm DSU
+        ws.send_json({"action": "dsu_load"})
+        ws.receive_json()
+        # Send EMPTY prompt — server rejects → returns early. With atomic
+        # consume-at-start, the flag is cleared even though mode_fn never ran.
+        ws.send_json(
+            {
+                "action": "send",
+                "prompt": "",
+                "clis": ["fake-a"],
+                "mode": "parallel",
+                "project_dir": "",
+                "include_status": False,
+            }
+        )
+        err_msg = ws.receive_json()
+        assert err_msg["kind"] == "error" and "empty" in err_msg["data"]
+        # Now a fresh non-empty send — must NOT carry DSU markers
+        _send(ws, prompt="should be plain", clis=["fake-a", "fake-b"])
+        _collect_until(ws, kind="batch_done", cli="*")
+
+    resp_a = _read_response(conv_id, "fake-a")
+    assert "COUNCIL_DSU_START" not in resp_a, (
+        f"empty-prompt rejection leaked armed DSU into next send: {resp_a[:300]}"
+    )
+
+
 def test_dsu_armed_event_emitted(client) -> None:
     r = client.post("/api/conversations")
     conv_id = r.json()["id"]

@@ -157,20 +157,17 @@ class Conversation:
         self._sessions_lock = asyncio.Lock()
         # Manifest writes also load-modify-write; reuse same pattern.
         self._manifest_lock = asyncio.Lock()
-        # One-shot DSU flag — set by `/dsu` action, consumed by the next send,
-        # cleared at the end of that send. Lives in-memory only (per-process
-        # Conversation singleton via get_or_create) since it's transient state.
+        # One-shot DSU flag — set by `/dsu` action, consumed atomically at the
+        # START of the next send. Lives in-memory only (per-process Conversation
+        # singleton via get_or_create) since it's transient state.
         self._dsu_pending = False
-        # v0.5: per-send rc record keyed by cli; reset at start of each send.
-        # Codex bot P2: a CLI that emits stdout then exits non-zero would
-        # otherwise be persisted to peer_log with error=false and pollute the
-        # next DSU. stream_cli writes here; ws_stream reads after mode_fn.
-        self._last_rcs: dict[str, int] = {}
-        # v0.5: per-send tracking of which CLIs have already received a DSU
-        # injection in run_cli_wrapped — so DSU lands on the FIRST call per CLI
-        # regardless of mode-specific label (cascade uses "draft", moa uses
-        # "prop_r1", router uses "classify"/"answer", parallel/debate use "r1").
-        self._dsu_emitted_to: set[str] = set()
+        # v0.5 Codex audit MUST-FIX: serialize entire `send` actions on a single
+        # conv_id so concurrent WebSocket clients (two tabs, reconnect overlap)
+        # can't race on per-send transient state. Each send acquires this lock
+        # for its full duration — DSU consume → run modes → peer_log write.
+        # `_last_rcs` and `_dsu_emitted_to` are no longer conversation-scoped;
+        # they live as per-send locals inside ws_stream's send block.
+        self._send_lock = asyncio.Lock()
 
     def write_event(self, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
@@ -318,6 +315,7 @@ async def stream_cli(
     cwd: Path | None = None,
     options: dict[str, object] | None = None,
     session_id: str | None = None,
+    rc_sink: dict[str, int] | None = None,
 ) -> str:
     """Spawn one CLI subprocess, stream its stdout/stderr line-by-line over WS.
 
@@ -408,11 +406,13 @@ async def stream_cli(
         captured_session_id = extract_session_id(entry, full_response)
         if captured_session_id:
             await conv.set_cli_session(cli, captured_session_id)
-        # v0.5 Codex bot P2: record rc per CLI for THIS send so peer_log can
-        # mark entries with error=true when the CLI exited non-zero, even if
-        # it emitted stdout before failing. Stream_cli is the only place rc
-        # is known; we stash it on conv for the post-mode_fn peer_log write.
-        conv._last_rcs[cli] = rc
+        # v0.5 Codex bot P2 + audit MUST-FIX: record rc per CLI for THIS send
+        # so peer_log can mark entries with error=true when the CLI exited
+        # non-zero, even if it emitted stdout before failing. `rc_sink` is a
+        # per-send dict owned by the caller (ws_stream); we never touch
+        # conversation-scoped state here, which was the race in the audit.
+        if rc_sink is not None:
+            rc_sink[cli] = rc
         conv.write_event(
             {
                 "kind": "cli_done",
@@ -710,229 +710,227 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             if action != "send":
                 await ws.send_json({"cli": "*", "kind": "error", "data": "unknown action"})
                 continue
-            prompt = msg.get("prompt", "").strip()
-            clis = msg.get("clis") or ["codex", "claude"]
-            mode_name = msg.get("mode", "parallel")
-            include_status = bool(msg.get("include_status", True))
-            project_dir_raw = msg.get("project_dir") or ""
-            cli_options_raw = msg.get("cli_options") or {}
-            cli_options: dict[str, dict[str, object]] = {}
-            if isinstance(cli_options_raw, dict):
-                for cli_name, opts in cli_options_raw.items():
-                    if isinstance(cli_name, str) and isinstance(opts, dict):
-                        cli_options[cli_name] = {
-                            str(k): v for k, v in opts.items() if isinstance(k, str)
-                        }
-            if not prompt:
-                await ws.send_json({"cli": "*", "kind": "error", "data": "empty prompt"})
-                continue
-            # Trust check on project_dir before any spawn.
-            decision = trust.check(project_dir_raw or None)
-            if not decision.is_trusted:
-                await ws.send_json(
-                    {
-                        "cli": "*",
-                        "kind": "trust_required",
-                        "data": str(decision.canonical),
-                        "reason": decision.reason,
-                    }
-                )
-                continue
-            conv_cwd = decision.canonical
-            mode_fn = MODES.get(mode_name)
-            if mode_fn is None:
-                await ws.send_json(
-                    {"cli": "*", "kind": "error", "data": f"unknown mode '{mode_name}'"}
-                )
-                continue
-            conv.write_prompt(prompt)
-            conv.write_event(
-                {
-                    "kind": "send",
-                    "prompt_len": len(prompt),
-                    "clis": clis,
-                    "mode": mode_name,
-                    "cwd": str(conv_cwd),
-                }
-            )
-            # Persist per-conversation manifest (project_dir, selected_clis, mode, options).
-            # Use save_manifest to preserve peer_sync_mode/peer_budget_tokens that may
-            # already be set in the file from earlier /set_peer_sync calls.
-            await conv.save_manifest(
-                {
-                    "project_dir": str(conv_cwd),
-                    "selected_clis": clis,
-                    "mode": mode_name,
-                    "include_status": include_status,
-                    "cli_options": cli_options,
-                }
-            )
-            await ws.send_json(
-                {
-                    "cli": "*",
-                    "kind": "info",
-                    "data": f"mode={mode_name} → CLIs {clis} (cwd={conv_cwd})",
-                }
-            )
-
-            # Snapshot per-CLI session ids saved from prior turns. We read once here
-            # (not per spawn) so all CLIs in this send agree on what they're resuming.
-            cli_sessions = conv.load_cli_sessions()
-
-            # v0.5: reset per-send state — rc tracking + DSU-emitted set. The
-            # rc tracking lets us mark peer_log entries as error=true when a
-            # CLI exited non-zero (Codex bot P2 #2). The emitted-to set lets
-            # DSU land on the FIRST run_cli call per CLI regardless of mode
-            # label (Codex bot P2 #3): cascade uses "draft", moa uses "prop_r1",
-            # router uses "classify"/"answer", parallel/debate use "r1".
-            conv._last_rcs = {}
-            conv._dsu_emitted_to = set()
-
-            # v0.5 DSU: if the user armed a peer brief AND peer_sync_mode == "dsu",
-            # render the brief ONCE here per receiver. The block is per-receiver
-            # because each CLI gets a version with its OWN entry filtered out
-            # (we never echo a CLI back its own last response — `--resume` already
-            # carries that. See peer_log.latest_per_cli(exclude=cli)).
-            dsu_armed = conv.dsu_pending and conv.peer_sync_mode == "dsu"
-            current_turn = conv.current_turn()
-            dsu_blocks: dict[str, str] = {}
-            if dsu_armed:
-                budget = conv.peer_budget_tokens
-                for cli_name in clis:
-                    peers = latest_per_cli(conv.peer_log_path, exclude=cli_name)
-                    dsu_blocks[cli_name] = build_dsu_block(
-                        turn=current_turn, peers=peers, budget_tokens=budget
-                    )
-                conv.write_event(
-                    {
-                        "kind": "dsu_inject",
-                        "turn": current_turn,
-                        "budget": budget,
-                        "non_empty_receivers": [
-                            c for c, b in dsu_blocks.items() if b
-                        ],
-                    }
-                )
-
-            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options
-            # + session_id. SOLE OWNER of status injection — stream_cli never re-injects.
-            # Bind via default args to avoid B023 (loop-variable closure).
-            async def run_cli_wrapped(
-                cli: str,
-                sub_prompt: str,
-                ws_in: WebSocket,
-                conv_in: Conversation,
-                label: str = "",
-                *,
-                _inject: bool = include_status,
-                _cwd: Path = conv_cwd,
-                _opts: dict[str, dict[str, object]] = cli_options,
-                _sessions: dict[str, str] = cli_sessions,
-                _dsu_blocks: dict[str, str] = dsu_blocks,
-            ) -> str:
-                # Codex bot P2 #3: DSU + status injection on the FIRST run_cli
-                # call per CLI in this send, regardless of mode-specific label.
-                # `conv._dsu_emitted_to` is reset at the start of each send and
-                # tracks which CLIs have already received their injection. Within-
-                # mode subsequent rounds (debate r2, cascade critique, etc.)
-                # already pack peers via mode helpers, so no double-state.
-                is_first_call = cli not in conv_in._dsu_emitted_to
-                dsu = _dsu_blocks.get(cli, "") if is_first_call else ""
-                if is_first_call:
-                    conv_in._dsu_emitted_to.add(cli)
-                    final_prompt = build_full_prompt(
-                        sub_prompt, include_status=_inject, dsu_block=dsu
-                    )
-                else:
-                    final_prompt = sub_prompt
-                raw = await stream_cli(
-                    cli,
-                    final_prompt,
-                    ws_in,
-                    conv_in,
-                    label,
-                    cwd=_cwd,
-                    options=_opts.get(cli),
-                    session_id=_sessions.get(cli),
-                )
-                # Strip DSU markers from the response BEFORE the mode helpers
-                # (pack_for_revision etc.) quote it into the next round's prompt.
-                # If we don't strip here, cascade's reviser would receive the
-                # drafter's response WITH the DSU block we injected on the
-                # drafter's first call — and quote it verbatim into the
-                # reviser's prompt, which then propagates to the validator etc.
-                # Persisted artifacts (`responses/<cli>__<label>.md`, peer_log)
-                # keep the raw text — only the value FED BACK INTO the mode
-                # pipeline is cleaned.
-                return strip_dsu_markers(raw)
-
-            try:
-                result: ModeResult = await mode_fn(
-                    prompt, clis, ws, conv, run_cli_wrapped
-                )
-                conv.write_event(
-                    {
-                        "kind": "mode_done",
-                        "mode": result["mode"],
-                        "rounds": result["rounds"],
-                        "final_len": len(result["final_text"]),
-                    }
-                )
-                # Save final summary if mode produced one
-                if result["final_text"]:
-                    (conv.dir / "final.md").write_text(
-                        result["final_text"], encoding="utf-8"
-                    )
-                # v0.5: persist this turn's peer log — one entry per CLI using the
-                # CLI's FINAL per-send response (last element of its history).
-                # `from_response` strips any embedded COUNCIL_DSU_* markers so a
-                # CLI that quoted the previous turn's brief doesn't recurse.
-                #
-                # Codex bot P2 #2: error=true if EITHER the history holds a
-                # synthetic "[error: ...]" string (asyncio.gather exception) OR
-                # the subprocess exited non-zero (recorded in `_last_rcs` by
-                # stream_cli). The first catches mode-level failures; the second
-                # catches CLIs that printed stdout then failed — which would
-                # otherwise poison the next DSU with partial/error output.
-                turn_no = current_turn  # captured above before mode_fn ran
-                peer_entries: list[PeerLogEntry] = []
-                for cli_name, history in result["per_cli_history"].items():
-                    if not history:
-                        continue
-                    final_text = history[-1]
-                    is_error = bool(
-                        isinstance(final_text, str) and final_text.startswith("[error:")
-                    ) or (conv._last_rcs.get(cli_name, 0) != 0)
-                    peer_entries.append(
-                        PeerLogEntry.from_response(
-                            turn=turn_no,
-                            cli=cli_name,
-                            mode=result["mode"],
-                            text=str(final_text),
-                            error=is_error,
-                        )
-                    )
-                conv.write_peer_log(peer_entries)
-                summary = (
-                    f"mode={result['mode']} rounds={result['rounds']} "
-                    f"final={len(result['final_text'])}c"
-                )
-                await ws.send_json(
-                    {"cli": "*", "kind": "batch_done", "data": summary}
-                )
-            except Exception as e:
-                conv.write_event({"kind": "mode_error", "mode": mode_name, "err": str(e)})
-                await ws.send_json(
-                    {"cli": "*", "kind": "error", "data": f"mode failed: {e}"}
-                )
-            finally:
-                # One-shot DSU semantics: regardless of success/failure, this
-                # send consumed the trigger. Next turn is plain unless the user
-                # rearms via /dsu_load.
-                if dsu_armed:
-                    conv.set_dsu_pending(False)
+            # v0.5 Codex audit MUST-FIX: serialize all send actions on this
+            # conversation so two WS clients (tabs/reconnect) can't race on
+            # `cli_sessions.json`, peer_log turn numbering, or DSU one-shot
+            # consumption. The whole send block — DSU consume → run modes →
+            # peer_log write → flag clear — runs under the same lock.
+            async with conv._send_lock:
+                await _run_send_action(msg, ws, conv)
     except WebSocketDisconnect:
         return
+
+
+async def _run_send_action(msg: dict[str, Any], ws: WebSocket, conv: Conversation) -> None:
+    """Handle one 'send' action under conv._send_lock.
+
+    Extracted from ws_stream's loop so the lock scope is unambiguous and all
+    per-send state lives as locals here (not on the Conversation object).
+    Per-send locals replace v0.4-era `conv._last_rcs` and `conv._dsu_emitted_to`
+    — the Codex audit flagged those as conversation-scoped (cross-send) races.
+    """
+    prompt = msg.get("prompt", "").strip()
+    clis = msg.get("clis") or ["codex", "claude"]
+    mode_name = msg.get("mode", "parallel")
+    include_status = bool(msg.get("include_status", True))
+    project_dir_raw = msg.get("project_dir") or ""
+    cli_options_raw = msg.get("cli_options") or {}
+    cli_options: dict[str, dict[str, object]] = {}
+    if isinstance(cli_options_raw, dict):
+        for cli_name, opts in cli_options_raw.items():
+            if isinstance(cli_name, str) and isinstance(opts, dict):
+                cli_options[cli_name] = {
+                    str(k): v for k, v in opts.items() if isinstance(k, str)
+                }
+    if not prompt:
+        await ws.send_json({"cli": "*", "kind": "error", "data": "empty prompt"})
+        return
+    # Trust check on project_dir before any spawn.
+    decision = trust.check(project_dir_raw or None)
+    if not decision.is_trusted:
+        await ws.send_json(
+            {
+                "cli": "*",
+                "kind": "trust_required",
+                "data": str(decision.canonical),
+                "reason": decision.reason,
+            }
+        )
+        return
+    conv_cwd = decision.canonical
+    mode_fn = MODES.get(mode_name)
+    if mode_fn is None:
+        await ws.send_json(
+            {"cli": "*", "kind": "error", "data": f"unknown mode '{mode_name}'"}
+        )
+        return
+    conv.write_prompt(prompt)
+    conv.write_event(
+        {
+            "kind": "send",
+            "prompt_len": len(prompt),
+            "clis": clis,
+            "mode": mode_name,
+            "cwd": str(conv_cwd),
+        }
+    )
+    # Persist per-conversation manifest (project_dir, selected_clis, mode, options).
+    # Use save_manifest to preserve peer_sync_mode/peer_budget_tokens that may
+    # already be set in the file from earlier /set_peer_sync calls.
+    await conv.save_manifest(
+        {
+            "project_dir": str(conv_cwd),
+            "selected_clis": clis,
+            "mode": mode_name,
+            "include_status": include_status,
+            "cli_options": cli_options,
+        }
+    )
+    await ws.send_json(
+        {
+            "cli": "*",
+            "kind": "info",
+            "data": f"mode={mode_name} → CLIs {clis} (cwd={conv_cwd})",
+        }
+    )
+
+    # Snapshot per-CLI session ids saved from prior turns. We read once here
+    # (not per spawn) so all CLIs in this send agree on what they're resuming.
+    cli_sessions = conv.load_cli_sessions()
+
+    # v0.5 Codex audit MUST-FIX: per-send transient state lives as locals here,
+    # NOT on the Conversation object. With concurrent sends fully serialized by
+    # conv._send_lock these would already not race, but keeping state per-send
+    # is defense-in-depth and clarifies ownership.
+    rcs: dict[str, int] = {}  # cli → exit code, populated by stream_cli via rc_sink
+    dsu_emitted_to: set[str] = set()  # CLIs that have received their first-call DSU
+
+    # v0.5 Codex audit MUST-FIX: consume the DSU one-shot flag ATOMICALLY at
+    # send start (read + clear). Previously the flag was cleared only in the
+    # post-mode_fn `finally` block, so a pre-mode exception (e.g. trust check
+    # failure raised after dsu_armed was captured) could leave the flag set
+    # for an unrelated next send. Capturing locally also means the per-WS
+    # client's choice can't be "stolen" by an overlapping send because we
+    # hold _send_lock for the duration.
+    dsu_armed = conv.dsu_pending and conv.peer_sync_mode == "dsu"
+    if dsu_armed:
+        conv.set_dsu_pending(False)
+    current_turn = conv.current_turn()
+    dsu_blocks: dict[str, str] = {}
+    if dsu_armed:
+        budget = conv.peer_budget_tokens
+        for cli_name in clis:
+            peers = latest_per_cli(conv.peer_log_path, exclude=cli_name)
+            dsu_blocks[cli_name] = build_dsu_block(
+                turn=current_turn, peers=peers, budget_tokens=budget
+            )
+        conv.write_event(
+            {
+                "kind": "dsu_inject",
+                "turn": current_turn,
+                "budget": budget,
+                "non_empty_receivers": [c for c, b in dsu_blocks.items() if b],
+            }
+        )
+
+    # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options
+    # + session_id. SOLE OWNER of status injection — stream_cli never re-injects.
+    # Bind via default args to avoid B023 (loop-variable closure).
+    async def run_cli_wrapped(
+        cli: str,
+        sub_prompt: str,
+        ws_in: WebSocket,
+        conv_in: Conversation,
+        label: str = "",
+        *,
+        _inject: bool = include_status,
+        _cwd: Path = conv_cwd,
+        _opts: dict[str, dict[str, object]] = cli_options,
+        _sessions: dict[str, str] = cli_sessions,
+        _dsu_blocks: dict[str, str] = dsu_blocks,
+        _dsu_emitted_to: set[str] = dsu_emitted_to,
+        _rcs: dict[str, int] = rcs,
+    ) -> str:
+        # Codex bot P2 #3 + audit MUST-FIX: DSU + status injection on the FIRST
+        # run_cli call per CLI in this send, regardless of mode-specific label.
+        # `_dsu_emitted_to` is the send-local set (not a Conversation field)
+        # so two concurrent sends can't share state.
+        is_first_call = cli not in _dsu_emitted_to
+        dsu = _dsu_blocks.get(cli, "") if is_first_call else ""
+        if is_first_call:
+            _dsu_emitted_to.add(cli)
+            final_prompt = build_full_prompt(
+                sub_prompt, include_status=_inject, dsu_block=dsu
+            )
+        else:
+            final_prompt = sub_prompt
+        raw = await stream_cli(
+            cli,
+            final_prompt,
+            ws_in,
+            conv_in,
+            label,
+            cwd=_cwd,
+            options=_opts.get(cli),
+            session_id=_sessions.get(cli),
+            rc_sink=_rcs,
+        )
+        # Strip DSU markers from the response BEFORE the mode helpers
+        # (pack_for_revision etc.) quote it into the next round's prompt.
+        # Persisted artifacts (`responses/<cli>__<label>.md`, peer_log) keep
+        # the raw text — only the value FED BACK INTO the mode pipeline is cleaned.
+        return strip_dsu_markers(raw)
+
+    try:
+        result: ModeResult = await mode_fn(prompt, clis, ws, conv, run_cli_wrapped)
+        conv.write_event(
+            {
+                "kind": "mode_done",
+                "mode": result["mode"],
+                "rounds": result["rounds"],
+                "final_len": len(result["final_text"]),
+            }
+        )
+        # Save final summary if mode produced one
+        if result["final_text"]:
+            (conv.dir / "final.md").write_text(
+                result["final_text"], encoding="utf-8"
+            )
+        # v0.5: persist this turn's peer log — one entry per CLI using the
+        # CLI's FINAL per-send response (last element of its history).
+        # `from_response` strips any embedded COUNCIL_DSU_* markers so a
+        # CLI that quoted the previous turn's brief doesn't recurse.
+        # Codex bot P2 #2: error=true if EITHER the history holds a synthetic
+        # "[error: ...]" string OR the subprocess exited non-zero (rc != 0,
+        # captured per-send in `rcs`).
+        peer_entries: list[PeerLogEntry] = []
+        for cli_name, history in result["per_cli_history"].items():
+            if not history:
+                continue
+            final_text = history[-1]
+            is_error = bool(
+                isinstance(final_text, str) and final_text.startswith("[error:")
+            ) or (rcs.get(cli_name, 0) != 0)
+            peer_entries.append(
+                PeerLogEntry.from_response(
+                    turn=current_turn,
+                    cli=cli_name,
+                    mode=result["mode"],
+                    text=str(final_text),
+                    error=is_error,
+                )
+            )
+        conv.write_peer_log(peer_entries)
+        summary = (
+            f"mode={result['mode']} rounds={result['rounds']} "
+            f"final={len(result['final_text'])}c"
+        )
+        await ws.send_json({"cli": "*", "kind": "batch_done", "data": summary})
+    except Exception as e:
+        conv.write_event({"kind": "mode_error", "mode": mode_name, "err": str(e)})
+        await ws.send_json(
+            {"cli": "*", "kind": "error", "data": f"mode failed: {e}"}
+        )
 
 
 if __name__ == "__main__":

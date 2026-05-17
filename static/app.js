@@ -124,12 +124,25 @@ async function newConversation() {
     state.ws.onopen = () => {
       appendStatus(`conversation ${id} ready`, "info");
       // Replay any pending peer-sync selection from before this WS existed
-      // (Codex bot P2 #1 fix). Also re-emits the current dropdown value if
-      // it differs from default 'off' — so a user who set 'dsu' in the UI
-      // before clicking "New conversation" still ends up with dsu applied.
+      // (Codex bot P2 #1 fix + audit SHOULD-FIX). Two cases:
+      //   1. User queued a non-default selection via the dropdown before
+      //      clicking New Conversation → replay it now.
+      //   2. User selected 'off' (rare) — we still send it so the manifest
+      //      reflects the user's explicit choice; otherwise the per-convo
+      //      default is 'off' anyway and the send is a near-no-op.
+      // Either way, ALWAYS clear pendingPeerSyncMode after consuming so a
+      // stale queued value can't override a freshly-changed dropdown on the
+      // next conversation.
       const sel = document.getElementById("peer-sync-mode");
-      const desired = state.pendingPeerSyncMode || (sel && sel.value);
-      if (desired && desired !== "off") {
+      const desired =
+        state.pendingPeerSyncMode !== null
+          ? state.pendingPeerSyncMode
+          : (sel && sel.value) || "off";
+      // Only emit if we have something meaningful to apply (skip the empty
+      // null/undefined case but DO emit 'off' if it was explicitly queued).
+      const shouldEmit =
+        state.pendingPeerSyncMode !== null || (desired && desired !== "off");
+      if (shouldEmit) {
         state.ws.send(
           JSON.stringify({
             action: "set_peer_sync",
@@ -137,8 +150,8 @@ async function newConversation() {
             budget_tokens: 64,
           }),
         );
-        state.pendingPeerSyncMode = null;
       }
+      state.pendingPeerSyncMode = null;
       resolve();
     };
   });
