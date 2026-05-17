@@ -102,6 +102,18 @@ def _read_cli_starts(conv_id: str) -> list[dict]:
     return starts
 
 
+def _read_response(conv_id: str, cli: str, label: str = "") -> str:
+    """Read what the fake CLI captured as its stdout. fake_cli echoes the
+    incoming prompt verbatim with `[name] | <line>` prefix, so we can verify
+    what Council actually passed in (including any injected DSU block).
+    """
+    suffix = f"__{label}" if label else ""
+    path = server.CONVERSATIONS / conv_id / "responses" / f"{cli}{suffix}.md"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
 # ---- Default state --------------------------------------------------------
 
 
@@ -134,7 +146,8 @@ def test_set_peer_sync_updates_manifest(client) -> None:
 
 def test_dsu_inject_on_next_send_excludes_self(client) -> None:
     """Two CLIs, dsu enabled. Turn 1 produces distinct sentinels. /dsu_load.
-    Turn 2: each CLI's argv must contain the OTHER's sentinel but NOT its own.
+    Turn 2: each CLI's received prompt must contain the OTHER's sentinel but
+    NOT its own (fake_cli echoes the prompt verbatim with `[name] | <line>`).
     """
     r = client.post("/api/conversations")
     conv_id = r.json()["id"]
@@ -154,25 +167,21 @@ def test_dsu_inject_on_next_send_excludes_self(client) -> None:
         _send(ws, prompt="round two prompt", clis=["fake-a", "fake-b"])
         _collect_until(ws, kind="batch_done", cli="*")
 
-    starts = _read_cli_starts(conv_id)
-    # Two CLIs × two turns = 4 cli_start events. Verify turn-2 events have DSU
-    # markers and contain peer's name but not own.
-    assert len(starts) == 4, f"expected 4 cli_starts, got {len(starts)}: {starts}"
-    # Turn-2 events are the LAST 2 (order: a-r1, b-r1, a-r2, b-r2).
-    t2_a = starts[2]
-    t2_b = starts[3]
-    cmd_a = " ".join(t2_a["cmd"]) if isinstance(t2_a["cmd"], list) else str(t2_a["cmd"])
-    cmd_b = " ".join(t2_b["cmd"]) if isinstance(t2_b["cmd"], list) else str(t2_b["cmd"])
+    # responses/fake-a.md holds fake-a's TURN-2 output (latest overwrite).
+    # fake_cli echoes the full incoming prompt, so the DSU block is visible.
+    resp_a = _read_response(conv_id, "fake-a")
+    resp_b = _read_response(conv_id, "fake-b")
 
     # Both turn-2 prompts must carry the DSU marker
-    assert "COUNCIL_DSU_START" in cmd_a
-    assert "COUNCIL_DSU_START" in cmd_b
-    # fake-a's prompt mentions fake-b's name (as the peer header) but not its
-    # own `**fake-a**` peer header (since self is excluded).
-    assert "**fake-b**" in cmd_a, f"fake-a's DSU block missing fake-b: {cmd_a[:500]}"
-    assert "**fake-a**" not in cmd_a, f"fake-a's DSU block leaked own entry: {cmd_a[:500]}"
-    assert "**fake-a**" in cmd_b
-    assert "**fake-b**" not in cmd_b
+    assert "COUNCIL_DSU_START" in resp_a, f"fake-a turn-2 no DSU marker: {resp_a[:500]}"
+    assert "COUNCIL_DSU_START" in resp_b, f"fake-b turn-2 no DSU marker: {resp_b[:500]}"
+    # fake-a's DSU block contains fake-b's peer header but NOT its own
+    assert "**fake-b**" in resp_a, f"fake-a's DSU missing fake-b: {resp_a[:500]}"
+    assert "**fake-a**" not in resp_a, (
+        f"fake-a's DSU leaked own entry: {resp_a[:500]}"
+    )
+    assert "**fake-a**" in resp_b
+    assert "**fake-b**" not in resp_b
 
 
 def test_dsu_one_shot_clears_after_send(client) -> None:
@@ -194,14 +203,15 @@ def test_dsu_one_shot_clears_after_send(client) -> None:
         _send(ws, prompt="turn three plain", clis=["fake-a", "fake-b"])
         _collect_until(ws, kind="batch_done", cli="*")
 
-    starts = _read_cli_starts(conv_id)
-    # 2 CLIs × 3 turns = 6 cli_starts. Last 2 are turn 3.
-    assert len(starts) == 6
-    for s in starts[-2:]:
-        cmd = " ".join(s["cmd"]) if isinstance(s["cmd"], list) else str(s["cmd"])
-        assert "COUNCIL_DSU_START" not in cmd, (
-            f"turn-3 had DSU markers after one-shot should have cleared: {cmd[:300]}"
-        )
+    # The response file is overwritten each turn → contains TURN-3 content.
+    resp_a = _read_response(conv_id, "fake-a")
+    resp_b = _read_response(conv_id, "fake-b")
+    assert "COUNCIL_DSU_START" not in resp_a, (
+        f"turn-3 fake-a had DSU markers; one-shot should have cleared: {resp_a[:400]}"
+    )
+    assert "COUNCIL_DSU_START" not in resp_b, (
+        f"turn-3 fake-b had DSU markers: {resp_b[:400]}"
+    )
 
 
 # ---- Storage --------------------------------------------------------------
@@ -278,15 +288,11 @@ def test_dsu_skips_failed_cli(client, monkeypatch) -> None:
         _send(ws, prompt="turn two", clis=["fake-a", "fake-b"])
         _collect_until(ws, kind="batch_done", cli="*")
 
-    starts = _read_cli_starts(conv_id)
-    t2 = starts[2]  # fake-a's turn 2 cli_start
-    cmd = " ".join(t2["cmd"]) if isinstance(t2["cmd"], list) else str(t2["cmd"])
+    resp_a = _read_response(conv_id, "fake-a")
     # fake-b failed → its entry has error=true → omitted from DSU block.
     # fake-a's DSU block should be EMPTY (no peers to report on), so no marker.
-    # (build_dsu_block returns empty string when no peers have non-empty content,
-    # so no marker block is added.)
-    assert "**fake-b**" not in cmd, (
-        f"fake-b should be omitted from DSU after its failure: {cmd[:500]}"
+    assert "**fake-b**" not in resp_a, (
+        f"fake-b should be omitted from DSU after its failure: {resp_a[:500]}"
     )
 
 
@@ -311,14 +317,13 @@ def test_dsu_budget_truncates_peer_text(client) -> None:
         _send(ws, prompt="next turn", clis=["fake-a", "fake-b"])
         _collect_until(ws, kind="batch_done", cli="*")
 
-    starts = _read_cli_starts(conv_id)
-    raw_cmd = starts[2]["cmd"]
-    cmd_t2_a = " ".join(raw_cmd) if isinstance(raw_cmd, list) else str(raw_cmd)
+    resp_a = _read_response(conv_id, "fake-a")
     # 8 tokens × 4 chars/token = ~32 chars per peer in the DSU block.
-    # The full 800-char echo cannot fit. We assert the X-run got truncated
-    # (no string of 100+ X's appears).
-    assert "X" * 100 not in cmd_t2_a, (
-        f"DSU block didn't truncate to budget: {cmd_t2_a[:500]}"
+    # The full 800-char echo cannot fit. We assert the X-run got truncated.
+    # fake_cli echoes the prompt with `[name] | ` prefix per line, so a long X
+    # run from turn-1's echo would show up if not truncated.
+    assert "X" * 100 not in resp_a, (
+        f"DSU block didn't truncate to budget: {resp_a[:500]}"
     )
 
 

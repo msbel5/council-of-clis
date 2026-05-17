@@ -45,7 +45,11 @@ def main() -> int:
 
     # Stream deterministic output. Newlines flush so Council's line-by-line pump sees
     # multiple stdout events instead of one big chunk.
-    print(f"[{name}] received: {prompt.strip()[:200]}")
+    # NOTE: prompt is echoed in full (no truncation) so e2e tests can verify what
+    # Council actually passed in — including injected DSU blocks, status, etc.
+    print(f"[{name}] received:")
+    for line in prompt.splitlines():
+        print(f"[{name}] | {line}")
     print(f"[{name}] reply: ok")
     print(f"session_id: {sid}")
     return 0
