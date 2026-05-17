@@ -26,7 +26,6 @@ from modes import (
     pack_for_revision,
 )
 
-
 # ---- Fakes ----------------------------------------------------------------
 
 
@@ -137,7 +136,7 @@ async def test_router_routes_based_on_classification() -> None:
     result = await mode_router("prompt", ["codex", "claude"], ws, None, run)
     assert result["mode"] == "router"
     # codex is preferred for CODE; second call returns the answer
-    assert "codex answer to code task" == result["final_text"]
+    assert result["final_text"] == "codex answer to code task"
 
 
 @pytest.mark.asyncio

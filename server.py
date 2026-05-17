@@ -20,17 +20,16 @@ import os
 import shutil
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from modes import MODES, ModeResult
-
 
 # ---- Paths ------------------------------------------------------------------
 
@@ -253,20 +252,16 @@ async def stream_cli(
             full_response, encoding="utf-8"
         )
         conv.write_event({"kind": "cli_done", "cli": cli, "label": label, "rc": rc})
-        try:
+        with suppress(Exception):
             await ws.send_json(
                 {"cli": cli, "kind": "done", "data": f"exit={rc}", "label": label}
             )
-        except Exception:
-            pass
     except Exception as e:
         conv.write_event({"kind": "cli_error", "cli": cli, "label": label, "err": str(e)})
-        try:
+        with suppress(Exception):
             await ws.send_json(
                 {"cli": cli, "kind": "error", "data": str(e), "label": label}
             )
-        except Exception:
-            pass
     return full_response
 
 
@@ -405,13 +400,20 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             )
 
             # Wrap stream_cli so modes get the captured text + status injection.
+            # Bind include_status via default arg to avoid B023 (loop-variable closure).
             async def run_cli_wrapped(
-                cli: str, sub_prompt: str, ws_in: WebSocket, conv_in: Conversation, label: str = ""
+                cli: str,
+                sub_prompt: str,
+                ws_in: WebSocket,
+                conv_in: Conversation,
+                label: str = "",
+                *,
+                _inject: bool = include_status,
             ) -> str:
                 # Re-inject status when the mode hands a packaged prompt? Only on round 1.
                 # For internal rounds (label != "r1" and != ""), DO NOT re-inject — packaged
                 # prompts already include the original task.
-                if label in ("", "r1") and include_status:
+                if label in ("", "r1") and _inject:
                     final_prompt = build_full_prompt(sub_prompt, include_status=True)
                 else:
                     final_prompt = sub_prompt
@@ -434,12 +436,12 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     (conv.dir / "final.md").write_text(
                         result["final_text"], encoding="utf-8"
                     )
+                summary = (
+                    f"mode={result['mode']} rounds={result['rounds']} "
+                    f"final={len(result['final_text'])}c"
+                )
                 await ws.send_json(
-                    {
-                        "cli": "*",
-                        "kind": "batch_done",
-                        "data": f"mode={result['mode']} rounds={result['rounds']} final={len(result['final_text'])}c",
-                    }
+                    {"cli": "*", "kind": "batch_done", "data": summary}
                 )
             except Exception as e:
                 conv.write_event({"kind": "mode_error", "mode": mode_name, "err": str(e)})

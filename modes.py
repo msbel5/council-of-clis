@@ -20,7 +20,8 @@ Status messages stream as `{"cli": "*", "kind": "phase", "data": "<phase name>"}
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Protocol, TypedDict
+from collections.abc import Awaitable, Callable
+from typing import Protocol, TypedDict
 
 # ---- Protocol -------------------------------------------------------------
 
@@ -159,7 +160,7 @@ async def mode_parallel(
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     history = {
         cli: [str(r) if not isinstance(r, Exception) else f"[error: {r}]"]
-        for cli, r in zip(tasks.keys(), results)
+        for cli, r in zip(tasks.keys(), results, strict=False)
     }
     return ModeResult(mode="parallel", rounds=1, final_text="", per_cli_history=history)
 
@@ -179,7 +180,7 @@ async def mode_debate(
     await _phase(ws, f"DEBATE round 1/{max_rounds}: independent answers")
     r1_tasks = {cli: asyncio.create_task(run_cli(cli, prompt, ws, conv, "r1")) for cli in clis}
     r1 = await asyncio.gather(*r1_tasks.values(), return_exceptions=True)
-    for cli, res in zip(r1_tasks.keys(), r1):
+    for cli, res in zip(r1_tasks.keys(), r1, strict=False):
         history[cli].append(str(res) if not isinstance(res, Exception) else f"[error: {res}]")
 
     # Rounds 2..max: each agent sees everyone else's prior round, revises
@@ -195,7 +196,7 @@ async def mode_debate(
                 run_cli(cli, packed, ws, conv, f"r{round_no}")
             )
         rr = await asyncio.gather(*revise_tasks.values(), return_exceptions=True)
-        for cli, res in zip(revise_tasks.keys(), rr):
+        for cli, res in zip(revise_tasks.keys(), rr, strict=False):
             history[cli].append(
                 str(res) if not isinstance(res, Exception) else f"[error: {res}]"
             )
@@ -230,7 +231,9 @@ async def mode_cascade(
     history[drafter].append(draft)
 
     await _phase(ws, f"CASCADE step 2/4: {critic} critiques")
-    critique = await run_cli(critic, pack_for_critique(prompt, draft, drafter), ws, conv, "critique")
+    critique = await run_cli(
+        critic, pack_for_critique(prompt, draft, drafter), ws, conv, "critique"
+    )
     history[critic].append(critique)
 
     await _phase(ws, f"CASCADE step 3/4: {reviser} revises")
@@ -287,14 +290,16 @@ async def mode_moa(
                 packed = pack_for_revision(prompt, history[p][-1], others)
             tasks[p] = asyncio.create_task(run_cli(p, packed, ws, conv, f"prop_r{r}"))
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for p, res in zip(tasks.keys(), results):
+        for p, res in zip(tasks.keys(), results, strict=False):
             history[p].append(
                 str(res) if not isinstance(res, Exception) else f"[error: {res}]"
             )
 
     await _phase(ws, f"MoA aggregation by {aggregator}")
     proposals = {p: history[p][-1] for p in proposers}
-    final = await run_cli(aggregator, pack_for_aggregation(prompt, proposals), ws, conv, "aggregate")
+    final = await run_cli(
+        aggregator, pack_for_aggregation(prompt, proposals), ws, conv, "aggregate"
+    )
     history[aggregator].append(final)
 
     return ModeResult(
@@ -393,7 +398,7 @@ async def mode_consensus(
     await _phase(ws, f"CONSENSUS round 1/{max_rounds}: independent answers")
     r1 = {cli: asyncio.create_task(run_cli(cli, prompt, ws, conv, "r1")) for cli in clis}
     res1 = await asyncio.gather(*r1.values(), return_exceptions=True)
-    for cli, r in zip(r1.keys(), res1):
+    for cli, r in zip(r1.keys(), res1, strict=False):
         history[cli].append(str(r) if not isinstance(r, Exception) else f"[error: {r}]")
 
     final = history[clis[0]][-1] if clis else ""
@@ -420,7 +425,7 @@ async def mode_consensus(
             packed = pack_for_revision(prompt, history[cli][-1], others)
             tasks[cli] = asyncio.create_task(run_cli(cli, packed, ws, conv, f"r{rd}"))
         rr = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for cli, r in zip(tasks.keys(), rr):
+        for cli, r in zip(tasks.keys(), rr, strict=False):
             history[cli].append(str(r) if not isinstance(r, Exception) else f"[error: {r}]")
         final = history[clis[0]][-1]
 
