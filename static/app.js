@@ -10,6 +10,10 @@ const state = {
   selected: new Set(),
   options: {},       // {cli_name: {opt_name: value}}
   inFlight: false,
+  // v0.5: peer-sync selection captured before a WS opens (Codex bot P2 #1).
+  // Replayed via /set_peer_sync as soon as the WS is established so the user's
+  // pre-conversation choice isn't silently dropped.
+  pendingPeerSyncMode: null,
 };
 
 function setInFlight(value) {
@@ -119,6 +123,35 @@ async function newConversation() {
   await new Promise((resolve) => {
     state.ws.onopen = () => {
       appendStatus(`conversation ${id} ready`, "info");
+      // Replay any pending peer-sync selection from before this WS existed
+      // (Codex bot P2 #1 fix + audit SHOULD-FIX). Two cases:
+      //   1. User queued a non-default selection via the dropdown before
+      //      clicking New Conversation → replay it now.
+      //   2. User selected 'off' (rare) — we still send it so the manifest
+      //      reflects the user's explicit choice; otherwise the per-convo
+      //      default is 'off' anyway and the send is a near-no-op.
+      // Either way, ALWAYS clear pendingPeerSyncMode after consuming so a
+      // stale queued value can't override a freshly-changed dropdown on the
+      // next conversation.
+      const sel = document.getElementById("peer-sync-mode");
+      const desired =
+        state.pendingPeerSyncMode !== null
+          ? state.pendingPeerSyncMode
+          : (sel && sel.value) || "off";
+      // Only emit if we have something meaningful to apply (skip the empty
+      // null/undefined case but DO emit 'off' if it was explicitly queued).
+      const shouldEmit =
+        state.pendingPeerSyncMode !== null || (desired && desired !== "off");
+      if (shouldEmit) {
+        state.ws.send(
+          JSON.stringify({
+            action: "set_peer_sync",
+            mode: desired,
+            budget_tokens: 64,
+          }),
+        );
+      }
+      state.pendingPeerSyncMode = null;
       resolve();
     };
   });
@@ -377,6 +410,32 @@ async function pickFolder() {
   }
 }
 
+// ---- DSU (v0.5 peer awareness) ----
+
+function dsuLoad() {
+  if (!state.ws || state.ws.readyState !== 1) {
+    appendStatus("no active conversation — start one before triggering DSU", "error");
+    return;
+  }
+  state.ws.send(JSON.stringify({ action: "dsu_load" }));
+}
+
+function setPeerSync() {
+  const sel = document.getElementById("peer-sync-mode");
+  if (!state.ws || state.ws.readyState !== 1) {
+    // Stash the choice; replay it when the WS opens (Codex bot P2 #1).
+    state.pendingPeerSyncMode = sel.value;
+    appendStatus(
+      `peer-sync queued: ${sel.value} (applies when a conversation opens)`,
+      "info",
+    );
+    return;
+  }
+  state.ws.send(
+    JSON.stringify({ action: "set_peer_sync", mode: sel.value, budget_tokens: 64 }),
+  );
+}
+
 // ---- Init ----
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -395,6 +454,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("save-status").addEventListener("click", saveStatus);
   document.getElementById("trust-list").addEventListener("click", openTrustList);
   document.getElementById("browse-folder").addEventListener("click", pickFolder);
+  document.getElementById("dsu-load").addEventListener("click", dsuLoad);
+  document.getElementById("peer-sync-mode").addEventListener("change", setPeerSync);
 
   // Listen for component events
   document.addEventListener("cli-card:toggle", (e) => {
