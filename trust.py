@@ -28,14 +28,9 @@ TRUST_STORE = USER_CONFIG_DIR / "trusted_folders.json"
 # `EXACT` blocks only the literal path. `DESCENDANTS` blocks the path and everything under it.
 # (Root `/` and `C:/` go in EXACT — every other path is under root, so we can't blanket-block.)
 #
-# macOS-specific notes:
-# - `/Library` and `/System` are SIP-protected; we block descendants anyway so a
-#   slip-up doesn't cause a CLI to chdir into kext territory.
-# - `/private` is the real backing for `/etc`, `/var`, `/tmp` on macOS — blocking it
-#   prevents accidents like `Path("/private/var/log").resolve()` ending up under
-#   the descendants list via canonicalization but being spawned-into directly.
-# - `/opt/homebrew` is the Apple Silicon Homebrew prefix; never run a CLI inside
-#   the package manager's own tree.
+# macOS extras (split out — Codex bot P2 v0.4): a Linux user with a legit project
+# under `/private` or `/opt/homebrew` shouldn't be blocked by macOS-only rules.
+# `/Library` and `/System` stay in the shared POSIX list (pre-existing behavior).
 _FORBIDDEN_EXACT_POSIX = (Path("/"),)
 _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/etc"),
@@ -48,6 +43,9 @@ _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/var/log"),
     Path("/Library"),
     Path("/System"),
+)
+# macOS-only additions: SIP-backing path + Apple-silicon Homebrew prefix.
+_FORBIDDEN_DESCENDANTS_DARWIN_EXTRA = (
     Path("/private"),
     Path("/opt/homebrew"),
 )
@@ -82,6 +80,8 @@ def _forbidden_exact() -> tuple[Path, ...]:
 def _forbidden_descendants() -> tuple[Path, ...]:
     if sys.platform.startswith("win"):
         return _FORBIDDEN_DESCENDANTS_WIN
+    if sys.platform == "darwin":
+        return _FORBIDDEN_DESCENDANTS_POSIX + _FORBIDDEN_DESCENDANTS_DARWIN_EXTRA
     return _FORBIDDEN_DESCENDANTS_POSIX
 
 

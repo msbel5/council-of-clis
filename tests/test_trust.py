@@ -77,6 +77,22 @@ def test_forbidden_root_blocked_on_macos() -> None:
     assert is_forbidden(Path("/Applications")) is None  # Allowed — user repos OK
 
 
+def test_macos_extras_not_blocked_on_linux() -> None:
+    """Codex bot v0.4 P2: macOS-only paths must NOT be rejected on Linux hosts.
+
+    A Linux user with a legit project under `/private/whatever` or
+    `/opt/homebrew/whatever` shouldn't hit the trust forbidden-roots wall.
+    """
+    if not sys.platform.startswith("linux"):
+        pytest.skip("linux-only check")
+    # These are macOS-only in the descendants list — Linux should let them through
+    # (provided they aren't under another forbidden path like /usr).
+    assert is_forbidden(Path("/private")) is None
+    assert is_forbidden(Path("/private/myproject")) is None
+    assert is_forbidden(Path("/opt/homebrew")) is None
+    assert is_forbidden(Path("/opt/homebrew/whatever")) is None
+
+
 def test_forbidden_root_blocked_on_windows() -> None:
     if not sys.platform.startswith("win"):
         pytest.skip("windows-only check")

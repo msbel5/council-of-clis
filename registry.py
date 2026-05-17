@@ -267,15 +267,23 @@ def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
         raise RegistryError(
             f"{source}: cli '{name}' has invalid `session_id_pattern` — must be a string"
         )
-    # Validate the regex compiles; refuses garbage at load time.
+    # Validate the regex compiles AND has exactly one capture group.
+    # Codex bot v0.4 P2: a pattern like `(label):\s*(id)` would silently let
+    # `extract_session_id` save the wrong group, corrupting resume on next turn.
     if session_pattern_raw:
         import re as _re
         try:
-            _re.compile(session_pattern_raw)
+            _compiled = _re.compile(session_pattern_raw)
         except _re.error as exc:
             raise RegistryError(
                 f"{source}: cli '{name}' session_id_pattern is not a valid regex: {exc}"
             ) from exc
+        if _compiled.groups != 1:
+            raise RegistryError(
+                f"{source}: cli '{name}' session_id_pattern must have exactly one "
+                f"capture group (the session id); found {_compiled.groups}. Use "
+                "non-capturing groups `(?:...)` for grouping you don't want captured."
+            )
     if bool(resume_raw) != bool(session_pattern_raw):
         raise RegistryError(
             f"{source}: cli '{name}' must declare BOTH resume_command and "

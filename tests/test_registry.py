@@ -134,3 +134,96 @@ def test_non_headless_entry_not_available() -> None:
         headless_supported=False,
     )
     assert not entry.is_available()
+
+
+# ---- v0.4 session_id_pattern validation -----------------------------------
+
+
+def test_session_pattern_one_capture_group_ok() -> None:
+    """The canonical case: exactly one capture group."""
+    entry = _parse_one(
+        {
+            "name": "x",
+            "command": ["x"],
+            "invocation_mode": "argv",
+            "resume_command": ["x", "--resume", "{session_id}"],
+            "session_id_pattern": r"sid=([0-9a-f]+)",
+        },
+        "test",
+    )
+    assert entry.session_id_pattern == r"sid=([0-9a-f]+)"
+
+
+def test_session_pattern_zero_capture_groups_rejected() -> None:
+    """A pattern with no capture group can't yield an id — fail at load."""
+    with pytest.raises(RegistryError, match="exactly one capture group"):
+        _parse_one(
+            {
+                "name": "x",
+                "command": ["x"],
+                "invocation_mode": "argv",
+                "resume_command": ["x", "--resume", "{session_id}"],
+                "session_id_pattern": r"sid=[0-9a-f]+",  # no group
+            },
+            "test",
+        )
+
+
+def test_session_pattern_two_capture_groups_rejected() -> None:
+    """Codex bot P2: `(label):(value)` would silently save the wrong group."""
+    with pytest.raises(RegistryError, match="exactly one capture group"):
+        _parse_one(
+            {
+                "name": "x",
+                "command": ["x"],
+                "invocation_mode": "argv",
+                "resume_command": ["x", "--resume", "{session_id}"],
+                "session_id_pattern": r"(session_id):\s*([0-9a-f]+)",
+            },
+            "test",
+        )
+
+
+def test_session_pattern_non_capturing_group_is_one_group() -> None:
+    """Non-capturing groups `(?:...)` don't count — pattern is still 1 capture group."""
+    entry = _parse_one(
+        {
+            "name": "x",
+            "command": ["x"],
+            "invocation_mode": "argv",
+            "resume_command": ["x", "--resume", "{session_id}"],
+            "session_id_pattern": r"(?:[Ss]ession[_\s]?[Ii][Dd])\s*[:=]\s*([0-9a-fA-F-]{8,})",
+        },
+        "test",
+    )
+    assert "?:" in entry.session_id_pattern
+
+
+def test_resume_without_pattern_rejected() -> None:
+    """Both-or-neither rule: resume_command without session_id_pattern fails."""
+    with pytest.raises(RegistryError, match="BOTH resume_command and"):
+        _parse_one(
+            {
+                "name": "x",
+                "command": ["x"],
+                "invocation_mode": "argv",
+                "resume_command": ["x", "--resume", "{session_id}"],
+                # no session_id_pattern
+            },
+            "test",
+        )
+
+
+def test_pattern_without_resume_rejected() -> None:
+    """Mirror: session_id_pattern without resume_command fails."""
+    with pytest.raises(RegistryError, match="BOTH resume_command and"):
+        _parse_one(
+            {
+                "name": "x",
+                "command": ["x"],
+                "invocation_mode": "argv",
+                "session_id_pattern": r"sid=([0-9a-f]+)",
+                # no resume_command
+            },
+            "test",
+        )
