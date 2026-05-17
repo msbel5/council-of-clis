@@ -82,6 +82,21 @@ def apply_options(entry: CLIEntry, options: Mapping[str, object]) -> tuple[str, 
     return tuple([*entry.command, *extras])
 
 
+def _select_command(
+    entry: CLIEntry, session_id: str | None
+) -> tuple[str, ...]:
+    """Return resume_command (with {session_id} substituted) if we have a session id
+    and the entry supports resume; else the fresh command.
+    """
+    if session_id and entry.supports_resume:
+        return tuple(
+            session_id if tok == "{session_id}" else tok
+            for tok in entry.resume_command
+        )
+    # Strip any stray {session_id} from the fresh command (defensive).
+    return tuple(tok for tok in entry.command if tok != "{session_id}")
+
+
 def build_spawn_spec(
     entry: CLIEntry,
     prompt: str,
@@ -89,14 +104,33 @@ def build_spawn_spec(
     cwd: Path,
     options: Mapping[str, object] | None = None,
     extra_env: dict[str, str] | None = None,
+    session_id: str | None = None,
 ) -> SpawnSpec:
-    """Compose a SpawnSpec from a registry entry, a prompt, options, and a cwd.
+    """Compose a SpawnSpec from a registry entry, a prompt, options, cwd, and an
+    optional saved session_id (continues a CLI's prior turn when supported).
 
-    For `argv` mode, the prompt is appended as the final argv element at spawn time
-    (in `spawn()` below, not here — keeps the spec inspectable).
+    For `argv` mode, the prompt is substituted into {prompt} or appended.
     For `stdin` mode, the prompt is piped to stdin by the caller.
     """
-    argv = apply_options(entry, options or {})
+    # apply_options operates on a "base command" which may be the resume variant
+    # when we have a session id — so swap entry.command for that variant briefly.
+    base_argv = _select_command(entry, session_id)
+    # Build an ephemeral CLIEntry-like for apply_options without dataclass mutation
+    extras_entry = CLIEntry(
+        name=entry.name,
+        command=base_argv,
+        invocation_mode=entry.invocation_mode,
+        headless_supported=entry.headless_supported,
+        experimental=entry.experimental,
+        description=entry.description,
+        homepage=entry.homepage,
+        disabled=entry.disabled,
+        env=entry.env,
+        options_schema=entry.options_schema,
+        resume_command=entry.resume_command,
+        session_id_pattern=entry.session_id_pattern,
+    )
+    argv = apply_options(extras_entry, options or {})
     env = {**os.environ, "TERM": "dumb"}
     for k, v in entry.env.items():
         env[k] = v
@@ -157,11 +191,32 @@ async def spawn(spec: SpawnSpec) -> asyncio.subprocess.Process:
     raise ValueError(f"unknown invocation_mode: {spec.invocation_mode}")
 
 
+def extract_session_id(entry: CLIEntry, captured_stdout: str) -> str | None:
+    """Parse the CLI's stdout for a session id using its declared pattern.
+
+    Returns None if the CLI doesn't declare a pattern, or if no match was found.
+    The pattern must have exactly one capture group — the session id itself.
+    """
+    if not entry.session_id_pattern:
+        return None
+    import re
+
+    match = re.search(entry.session_id_pattern, captured_stdout)
+    if match is None:
+        return None
+    try:
+        return match.group(1)
+    except IndexError:
+        # Pattern compiled but has no capture group — treat as no match.
+        return None
+
+
 __all__ = [
     "OptionSpec",
     "RegistryError",
     "SpawnSpec",
     "apply_options",
     "build_spawn_spec",
+    "extract_session_id",
     "spawn",
 ]

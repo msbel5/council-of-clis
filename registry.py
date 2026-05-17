@@ -101,7 +101,19 @@ class OptionSpec:
 
 @dataclass(frozen=True, slots=True)
 class CLIEntry:
-    """One registered CLI."""
+    """One registered CLI.
+
+    Session persistence (v0.4):
+    - `resume_command`: alternate token list used when Council has a saved session_id
+      for this CLI in the current conversation. Same {options}/{prompt} placeholders
+      apply, plus {session_id} substitutes the captured id.
+    - `session_id_pattern`: regex with one capture group; Council parses the CLI's
+      stdout after the run completes and stores the captured group as the session id
+      for the next turn.
+
+    If a CLI does not support resumption, leave both fields empty/None — every turn
+    starts fresh.
+    """
 
     name: str
     command: tuple[str, ...]
@@ -113,10 +125,16 @@ class CLIEntry:
     disabled: bool = False
     env: dict[str, str] = field(default_factory=dict)
     options_schema: tuple[OptionSpec, ...] = ()
+    resume_command: tuple[str, ...] = ()
+    session_id_pattern: str = ""
 
     @property
     def executable(self) -> str:
         return self.command[0]
+
+    @property
+    def supports_resume(self) -> bool:
+        return bool(self.resume_command) and bool(self.session_id_pattern)
 
     def is_available(self) -> bool:
         """True if the CLI binary is on PATH right now."""
@@ -235,6 +253,35 @@ def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
         seen_names.add(spec.name)
         parsed_opts.append(spec)
 
+    resume_raw = raw.get("resume_command") or []
+    if resume_raw and (
+        not isinstance(resume_raw, list)
+        or not all(isinstance(x, str) for x in resume_raw)
+    ):
+        raise RegistryError(
+            f"{source}: cli '{name}' has invalid `resume_command` — "
+            "must be a list of strings or omitted"
+        )
+    session_pattern_raw = raw.get("session_id_pattern", "")
+    if session_pattern_raw and not isinstance(session_pattern_raw, str):
+        raise RegistryError(
+            f"{source}: cli '{name}' has invalid `session_id_pattern` — must be a string"
+        )
+    # Validate the regex compiles; refuses garbage at load time.
+    if session_pattern_raw:
+        import re as _re
+        try:
+            _re.compile(session_pattern_raw)
+        except _re.error as exc:
+            raise RegistryError(
+                f"{source}: cli '{name}' session_id_pattern is not a valid regex: {exc}"
+            ) from exc
+    if bool(resume_raw) != bool(session_pattern_raw):
+        raise RegistryError(
+            f"{source}: cli '{name}' must declare BOTH resume_command and "
+            "session_id_pattern, or NEITHER"
+        )
+
     return CLIEntry(
         name=name,
         command=tuple(cmd),
@@ -246,6 +293,8 @@ def _parse_one(raw: dict[str, object], source: str) -> CLIEntry:
         disabled=bool(raw.get("disabled", False)),
         env={str(k): str(v) for k, v in env_raw.items()},
         options_schema=tuple(parsed_opts),
+        resume_command=tuple(resume_raw) if resume_raw else (),
+        session_id_pattern=session_pattern_raw,
     )
 
 

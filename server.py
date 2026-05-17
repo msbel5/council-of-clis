@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 import trust
 from modes import MODES, ModeResult
 from registry import CLIEntry, ensure_user_config_seeded, load_registry
-from spawn import build_spawn_spec
+from spawn import build_spawn_spec, extract_session_id
 from spawn import spawn as spawn_subprocess
 
 # ---- Paths ------------------------------------------------------------------
@@ -112,7 +112,11 @@ def build_full_prompt(prompt: str, include_status: bool = True) -> str:
 
 
 class Conversation:
-    """One conversation = one directory under conversations/."""
+    """One conversation = one directory under conversations/.
+
+    v0.4: per-CLI session ids (for `--resume`) live in `cli_sessions.json` so future
+    turns of the same Council conversation continue each CLI's transcript on its end.
+    """
 
     def __init__(self, conv_id: str) -> None:
         self.id = conv_id
@@ -120,6 +124,7 @@ class Conversation:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "responses").mkdir(exist_ok=True)
         self.log_path = self.dir / "events.jsonl"
+        self.sessions_path = self.dir / "cli_sessions.json"
 
     def write_event(self, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
@@ -131,6 +136,26 @@ class Conversation:
 
     def write_response(self, cli: str, content: str) -> None:
         (self.dir / "responses" / f"{cli}.md").write_text(content, encoding="utf-8")
+
+    def load_cli_sessions(self) -> dict[str, str]:
+        """Per-CLI session ids saved from prior turns of this conversation."""
+        if not self.sessions_path.exists():
+            return {}
+        try:
+            data = json.loads(self.sessions_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+
+    def set_cli_session(self, cli: str, session_id: str) -> None:
+        """Persist a CLI's session id for future turns."""
+        store = self.load_cli_sessions()
+        store[cli] = session_id
+        self.sessions_path.write_text(
+            json.dumps(store, indent=2, sort_keys=True), encoding="utf-8"
+        )
 
     @classmethod
     def new(cls) -> Conversation:
@@ -150,6 +175,7 @@ async def stream_cli(
     *,
     cwd: Path | None = None,
     options: dict[str, object] | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Spawn one CLI subprocess, stream its stdout/stderr line-by-line over WS.
 
@@ -175,7 +201,9 @@ async def stream_cli(
         return ""
 
     try:
-        spec = build_spawn_spec(entry, prompt, cwd=cwd or ROOT, options=options)
+        spec = build_spawn_spec(
+            entry, prompt, cwd=cwd or ROOT, options=options, session_id=session_id
+        )
     except Exception as exc:
         await ws.send_json(
             {"cli": cli, "kind": "error", "data": f"option error: {exc}", "label": label}
@@ -189,6 +217,8 @@ async def stream_cli(
             "mode": spec.invocation_mode,
             "cwd": str(spec.cwd),
             "options": dict(options or {}),
+            "resumed": session_id is not None,
+            "session_id": session_id,
         }
     )
     proc = await spawn_subprocess(spec)
@@ -232,7 +262,19 @@ async def stream_cli(
         (conv.dir / "responses" / f"{cli}{suffix}.md").write_text(
             full_response, encoding="utf-8"
         )
-        conv.write_event({"kind": "cli_done", "cli": cli, "label": label, "rc": rc})
+        # Extract session id from output if the CLI supports resumption.
+        captured_session_id = extract_session_id(entry, full_response)
+        if captured_session_id:
+            conv.set_cli_session(cli, captured_session_id)
+        conv.write_event(
+            {
+                "kind": "cli_done",
+                "cli": cli,
+                "label": label,
+                "rc": rc,
+                "captured_session_id": captured_session_id,
+            }
+        )
         with suppress(Exception):
             await ws.send_json(
                 {"cli": cli, "kind": "done", "data": f"exit={rc}", "label": label}
@@ -536,8 +578,12 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 }
             )
 
-            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options.
-            # SOLE OWNER of status injection — stream_cli never re-injects.
+            # Snapshot per-CLI session ids saved from prior turns. We read once here
+            # (not per spawn) so all CLIs in this send agree on what they're resuming.
+            cli_sessions = conv.load_cli_sessions()
+
+            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options
+            # + session_id. SOLE OWNER of status injection — stream_cli never re-injects.
             # Bind via default args to avoid B023 (loop-variable closure).
             async def run_cli_wrapped(
                 cli: str,
@@ -549,6 +595,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 _inject: bool = include_status,
                 _cwd: Path = conv_cwd,
                 _opts: dict[str, dict[str, object]] = cli_options,
+                _sessions: dict[str, str] = cli_sessions,
             ) -> str:
                 if label in ("", "r1") and _inject:
                     final_prompt = build_full_prompt(sub_prompt, include_status=True)
@@ -562,6 +609,7 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     label,
                     cwd=_cwd,
                     options=_opts.get(cli),
+                    session_id=_sessions.get(cli),
                 )
 
             try:
