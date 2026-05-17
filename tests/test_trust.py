@@ -58,8 +58,27 @@ def test_forbidden_root_blocked_on_posix() -> None:
 def test_forbidden_root_blocked_on_windows() -> None:
     if not sys.platform.startswith("win"):
         pytest.skip("windows-only check")
+    # EXACT roots: only the literal drive root
+    assert is_forbidden(Path("C:/")) is not None
+    assert is_forbidden(Path("C:\\")) is not None
+    # DESCENDANTS roots: path and any child
     assert is_forbidden(Path("C:/Windows")) is not None
     assert is_forbidden(Path("C:/Windows/System32")) is not None
+    assert is_forbidden(Path("C:/Program Files")) is not None
+    assert is_forbidden(Path("C:/ProgramData")) is not None
+    # Case-insensitive on Windows
+    assert is_forbidden(Path("c:/windows/system32")) is not None
+    # User folders under C:/Users are NOT forbidden (they're not in DESCENDANTS list)
+    # Note: this test path doesn't have to exist; is_forbidden only checks the rule.
+    assert is_forbidden(Path("C:/Users/test/project")) is None
+
+
+def test_exact_root_does_not_blanket_block_descendants_posix(tmp_path: Path) -> None:
+    """`/` is in EXACT list — only matches the literal root, not all paths under it."""
+    if sys.platform.startswith("win"):
+        pytest.skip("posix-only check")
+    assert is_forbidden(Path("/")) is not None  # exact root → blocked
+    assert is_forbidden(tmp_path) is None  # under /, not in DESCENDANTS list → safe
 
 
 def test_safe_path_not_forbidden(tmp_path: Path) -> None:

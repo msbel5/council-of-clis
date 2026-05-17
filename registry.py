@@ -99,7 +99,10 @@ def _load_toml(path: Path) -> list[CLIEntry]:
     if not path.exists():
         return []
     with path.open("rb") as f:
-        data = tomllib.load(f)
+        try:
+            data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise RegistryError(f"{path}: TOML parse error: {exc}") from exc
     raw_entries = data.get("cli", [])
     if not isinstance(raw_entries, list):
         raise RegistryError(f"{path}: top-level [[cli]] must be an array")

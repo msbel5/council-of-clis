@@ -6,7 +6,17 @@ const state = {
   convId: null,
   ws: null,
   availableClis: {},
+  inFlight: false,
 };
+
+function setInFlight(value) {
+  state.inFlight = value;
+  const btn = document.getElementById("send-btn");
+  if (btn) {
+    btn.disabled = value;
+    btn.textContent = value ? "Sending..." : "Send to selected CLIs";
+  }
+}
 
 // ---- DOM utils ----
 
@@ -89,6 +99,7 @@ async function newConversation() {
     const m = JSON.parse(ev.data);
     if (m.cli === "*") {
       if (m.kind === "trust_required") {
+        setInFlight(false);  // not actually running — waiting on user approval
         document.getElementById("trust-target").textContent = m.data;
         document.getElementById("trust-reason").textContent = m.reason || "needs approval";
         const dlg = document.getElementById("trust-dialog");
@@ -96,6 +107,9 @@ async function newConversation() {
         btn.onclick = () => approveTrust(m.data);
         dlg.showModal();
         return;
+      }
+      if (m.kind === "batch_done" || m.kind === "error") {
+        setInFlight(false);
       }
       const cls = m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info";
       appendStatus(`[${m.kind}] ${m.data}`, cls);
@@ -139,6 +153,10 @@ function getSelectedClis() {
 }
 
 async function send() {
+  if (state.inFlight) {
+    appendStatus("already sending — wait for current run to finish", "error");
+    return;
+  }
   if (!state.ws || state.ws.readyState !== 1) {
     appendStatus("no active conversation — creating one", "info");
     await newConversation();
@@ -158,6 +176,7 @@ async function send() {
   const projectDir = document.getElementById("project-dir").value.trim();
   // Remember last-used project dir
   if (projectDir) localStorage.setItem("council:last-project-dir", projectDir);
+  setInFlight(true);
   state.ws.send(
     JSON.stringify({
       action: "send",

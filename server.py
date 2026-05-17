@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -49,6 +50,23 @@ for d in (STATIC, PROMPTS_DIR, CONVERSATIONS):
 # status.md is gitignored — your private project context lives here.
 if not STATUS_FILE.exists() and STATUS_EXAMPLE.exists():
     STATUS_FILE.write_text(STATUS_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+# ---- Validation helpers -----------------------------------------------------
+
+# conv_id is user-influenced (via WebSocket path + REST API). Validate hard against
+# any path-separator surprises before joining into CONVERSATIONS / conv_id.
+_CONV_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _validate_conv_id(conv_id: str) -> str:
+    """Return conv_id if safe, else raise HTTPException."""
+    if not conv_id or not _CONV_ID_PATTERN.match(conv_id) or len(conv_id) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid conversation id (expected [A-Za-z0-9_-]{1,64})",
+        )
+    return conv_id
 
 
 # ---- CLI registry -----------------------------------------------------------
@@ -139,6 +157,9 @@ async def stream_cli(
 
     `cwd` is the project folder the conversation is bound to (trusted at routing time).
     None means use Council's own working directory.
+
+    `prompt` is passed through verbatim — status injection happens in the dispatcher
+    (`run_cli_wrapped` in `ws_stream`) so this function never double-injects.
     """
     entry = REGISTRY.get(cli)
     if entry is None:
@@ -150,8 +171,7 @@ async def stream_cli(
         await ws.send_json({"cli": cli, "kind": "error", "data": reason, "label": label})
         return ""
 
-    full_prompt = build_full_prompt(prompt)
-    spec = build_spawn_spec(entry, full_prompt, cwd=cwd or ROOT)
+    spec = build_spawn_spec(entry, prompt, cwd=cwd or ROOT)
     conv.write_event(
         {
             "kind": "cli_start",
@@ -163,7 +183,7 @@ async def stream_cli(
     )
     proc = await spawn_subprocess(spec)
     if spec.invocation_mode == "stdin" and proc.stdin is not None:
-        proc.stdin.write(full_prompt.encode("utf-8"))
+        proc.stdin.write(prompt.encode("utf-8"))
         await proc.stdin.drain()
         proc.stdin.close()
 
@@ -220,9 +240,17 @@ async def stream_cli(
 
 
 class SendRequest(BaseModel):
+    """Payload schema for /ws/{conv_id} action='send' messages.
+
+    Kept as documentation of the wire contract used by static/app.js. Not currently
+    consumed via FastAPI body parsing because the WebSocket payload is parsed manually.
+    """
+
     prompt: str = Field(min_length=1)
     clis: list[str] = Field(default_factory=lambda: ["codex", "claude"])
+    mode: str = "parallel"
     include_status: bool = True
+    project_dir: str = ""
 
 
 # ---- FastAPI app ------------------------------------------------------------
@@ -339,6 +367,7 @@ async def list_conversations() -> dict[str, list[dict[str, Any]]]:
 
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation(conv_id: str) -> dict[str, Any]:
+    conv_id = _validate_conv_id(conv_id)
     d = CONVERSATIONS / conv_id
     if not d.exists():
         raise HTTPException(status_code=404, detail="not found")
@@ -359,6 +388,10 @@ async def list_modes() -> dict[str, list[str]]:
 
 @app.websocket("/ws/{conv_id}")
 async def ws_stream(ws: WebSocket, conv_id: str) -> None:
+    # Validate before path-join. Reject obvious traversal at the boundary.
+    if not _CONV_ID_PATTERN.match(conv_id) or len(conv_id) > 64:
+        await ws.close(code=1008, reason="invalid conv_id")
+        return
     await ws.accept()
     conv = Conversation(conv_id)
     try:
@@ -428,7 +461,8 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 }
             )
 
-            # Wrap stream_cli so modes get the captured text + status injection + cwd.
+            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd.
+            # SOLE OWNER of status injection — stream_cli never re-injects.
             # Bind via default args to avoid B023 (loop-variable closure).
             async def run_cli_wrapped(
                 cli: str,
@@ -440,9 +474,9 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 _inject: bool = include_status,
                 _cwd: Path = conv_cwd,
             ) -> str:
-                # Re-inject status when the mode hands a packaged prompt? Only on round 1.
-                # For internal rounds (label != "r1" and != ""), DO NOT re-inject — packaged
-                # prompts already include the original task.
+                # Inject status on round 1 / initial only — packaged multi-round prompts
+                # from modes.py already contain the original task and would double-prepend.
+                # If `_inject` is False the user explicitly disabled it; respect that.
                 if label in ("", "r1") and _inject:
                     final_prompt = build_full_prompt(sub_prompt, include_status=True)
                 else:
