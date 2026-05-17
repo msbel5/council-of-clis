@@ -45,14 +45,67 @@ header h1 {
   font-size: 12px;
 }
 
+.project-input {
+  flex: 1;
+  min-width: 200px;
+  max-width: 480px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--bg3);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.project-input:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
 .conv-id {
-  margin-left: auto;
   font-family: var(--mono);
   font-size: 11px;
   color: var(--fg2);
   background: var(--bg3);
   padding: 4px 8px;
   border-radius: 4px;
+}
+
+#trust-list-items {
+  list-style: none;
+  padding: 0;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+#trust-list-items li {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--bg3);
+}
+
+#trust-list-items li.muted {
+  color: var(--fg2);
+  font-style: italic;
+  border-bottom: 0;
+}
+
+.trust-revoke {
+  background: transparent;
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  margin-left: 8px;
+}
+
+.trust-revoke:hover {
+  background: var(--err);
+  color: white;
 }
 
 header button {

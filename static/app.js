@@ -88,6 +88,15 @@ async function newConversation() {
   state.ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.cli === "*") {
+      if (m.kind === "trust_required") {
+        document.getElementById("trust-target").textContent = m.data;
+        document.getElementById("trust-reason").textContent = m.reason || "needs approval";
+        const dlg = document.getElementById("trust-dialog");
+        const btn = document.getElementById("trust-approve");
+        btn.onclick = () => approveTrust(m.data);
+        dlg.showModal();
+        return;
+      }
       const cls = m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info";
       appendStatus(`[${m.kind}] ${m.data}`, cls);
       return;
@@ -146,6 +155,9 @@ async function send() {
   }
   const mode = document.getElementById("mode-select").value;
   const includeStatus = document.getElementById("include-status").checked;
+  const projectDir = document.getElementById("project-dir").value.trim();
+  // Remember last-used project dir
+  if (projectDir) localStorage.setItem("council:last-project-dir", projectDir);
   state.ws.send(
     JSON.stringify({
       action: "send",
@@ -153,9 +165,57 @@ async function send() {
       clis,
       mode,
       include_status: includeStatus,
+      project_dir: projectDir,
     }),
   );
-  appendStatus(`mode=${mode} → ${clis.join(", ")}...`, "info");
+  appendStatus(`mode=${mode} → ${clis.join(", ")} (cwd=${projectDir || "council"})...`, "info");
+}
+
+// ---- Trust ----
+
+async function openTrustList() {
+  const data = await api("/api/trust");
+  const list = document.getElementById("trust-list-items");
+  list.innerHTML = "";
+  if (data.trusted.length === 0) {
+    list.appendChild(el("li", { className: "muted" }, "no trusted folders yet"));
+  } else {
+    for (const path of data.trusted) {
+      const item = el(
+        "li",
+        {},
+        el("code", {}, path),
+        " ",
+        el("button", {
+          className: "trust-revoke",
+          onClick: async (e) => {
+            e.preventDefault();
+            await api("/api/trust/revoke", {
+              method: "POST",
+              body: JSON.stringify({ project_dir: path, note: "" }),
+            });
+            openTrustList();
+          },
+        }, "revoke"),
+      );
+      list.appendChild(item);
+    }
+  }
+  document.getElementById("trust-list-dialog").showModal();
+}
+
+async function approveTrust(target) {
+  try {
+    await api("/api/trust/approve", {
+      method: "POST",
+      body: JSON.stringify({ project_dir: target, note: "from Council UI" }),
+    });
+    appendStatus(`approved: ${target}`, "info");
+    document.getElementById("trust-dialog").close();
+    send();  // retry the prompt
+  } catch (err) {
+    appendStatus(`approve failed: ${err.message}`, "error");
+  }
 }
 
 // ---- Status editor ----
@@ -183,10 +243,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadClis();
   buildPanes(); // re-render with availability info
 
+  // Restore last-used project dir
+  const lastProjectDir = localStorage.getItem("council:last-project-dir");
+  if (lastProjectDir) document.getElementById("project-dir").value = lastProjectDir;
+
   document.getElementById("new-conv").addEventListener("click", newConversation);
   document.getElementById("send-btn").addEventListener("click", send);
   document.getElementById("open-status").addEventListener("click", openStatus);
   document.getElementById("save-status").addEventListener("click", saveStatus);
+  document.getElementById("trust-list").addEventListener("click", openTrustList);
 
   document.getElementById("prompt-input").addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") send();
