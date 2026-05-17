@@ -62,8 +62,13 @@ def client(fake_registry):
         yield c
 
 
-def _collect_until(ws, kind: str, cli: str = "*", limit: int = 200):
-    """Read WS messages until we see {cli, kind} or hit the limit."""
+def _collect_until(ws, kind: str, cli: str = "*", limit: int = 400):
+    """Read WS messages until we see {cli, kind} or hit the limit.
+
+    Bumped to 400 from 200 because consensus mode in CI under load can produce
+    enough phase + chunk events across 3 rounds × 3 CLIs that the original
+    cap was hit before batch_done arrived.
+    """
     events = []
     for _ in range(limit):
         msg = ws.receive_json()

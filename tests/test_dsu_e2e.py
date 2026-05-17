@@ -172,6 +172,33 @@ def test_dsu_inject_on_next_send_excludes_self(client) -> None:
     resp_a = _read_response(conv_id, "fake-a")
     resp_b = _read_response(conv_id, "fake-b")
 
+    # Diagnostic dump on failure (CI logs)
+    if not resp_a or "COUNCIL_DSU_START" not in resp_a:
+        conv_dir = server.CONVERSATIONS / conv_id
+        files_in_responses = list((conv_dir / "responses").iterdir()) if (conv_dir / "responses").exists() else []
+        events_text = (
+            (conv_dir / "events.jsonl").read_text(encoding="utf-8")
+            if (conv_dir / "events.jsonl").exists()
+            else "(no events.jsonl)"
+        )
+        peer_log_text = (
+            (conv_dir / "peer_log.jsonl").read_text(encoding="utf-8")
+            if (conv_dir / "peer_log.jsonl").exists()
+            else "(no peer_log.jsonl)"
+        )
+        manifest_text = (
+            (conv_dir / "manifest.json").read_text(encoding="utf-8")
+            if (conv_dir / "manifest.json").exists()
+            else "(no manifest.json)"
+        )
+        raise AssertionError(
+            f"fake-a turn-2 no DSU marker. resp_a={resp_a!r}\n"
+            f"responses files: {files_in_responses}\n"
+            f"manifest: {manifest_text}\n"
+            f"peer_log:\n{peer_log_text}\n"
+            f"events:\n{events_text}"
+        )
+
     # Both turn-2 prompts must carry the DSU marker
     assert "COUNCIL_DSU_START" in resp_a, f"fake-a turn-2 no DSU marker: {resp_a[:500]}"
     assert "COUNCIL_DSU_START" in resp_b, f"fake-b turn-2 no DSU marker: {resp_b[:500]}"
@@ -233,8 +260,10 @@ def test_peer_log_written_per_turn(client) -> None:
     for e in entries:
         assert e["turn"] == 1
         assert e["mode"] == "parallel"
-        assert "received: hi" in e["text"], (
-            f"peer log entry missing fake_cli sentinel: {e}"
+        # fake_cli echoes the prompt with "[name] | <line>" per line, so the
+        # raw "hi" appears with the pipe prefix in the captured stdout text.
+        assert "| hi" in e["text"], (
+            f"peer log entry missing fake_cli echo of 'hi': {e}"
         )
 
 
