@@ -691,6 +691,11 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     updates["peer_budget_tokens"] = bt
                 if updates:
                     await conv.save_manifest(updates)
+                # Codex bot v0.5 P2: turning peer_sync OFF must also clear any
+                # armed DSU brief — otherwise it lingers and fires later if the
+                # user re-enables DSU without explicitly re-arming via Standup.
+                if pm == "off":
+                    conv.set_dsu_pending(False)
                 await ws.send_json(
                     {
                         "cli": "*",

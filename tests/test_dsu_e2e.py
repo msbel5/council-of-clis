@@ -471,6 +471,36 @@ def test_pre_mode_failure_does_not_leak_dsu_armed(client) -> None:
     )
 
 
+def test_disabling_peer_sync_clears_armed_dsu(client) -> None:
+    """Codex bot v0.5 P2: user arms DSU, then switches peer_sync back to 'off'
+    via the dropdown. The armed flag must be cleared, NOT lingering to fire on
+    a later re-enable.
+    """
+    r = client.post("/api/conversations")
+    conv_id = r.json()["id"]
+    with client.websocket_connect(f"/ws/{conv_id}") as ws:
+        ws.send_json({"action": "set_peer_sync", "mode": "dsu", "budget_tokens": 64})
+        ws.receive_json()
+        _send(ws, prompt="t1", clis=["fake-a", "fake-b"])
+        _collect_until(ws, kind="batch_done", cli="*")
+        ws.send_json({"action": "dsu_load"})
+        ws.receive_json()
+        # Switch peer_sync to off WITHOUT sending — should clear the flag.
+        ws.send_json({"action": "set_peer_sync", "mode": "off", "budget_tokens": 64})
+        ws.receive_json()
+        # Re-enable peer_sync to dsu. Without the fix, the OLD armed flag would
+        # still fire here. With the fix, the user must click Standup again.
+        ws.send_json({"action": "set_peer_sync", "mode": "dsu", "budget_tokens": 64})
+        ws.receive_json()
+        _send(ws, prompt="t2", clis=["fake-a", "fake-b"])
+        _collect_until(ws, kind="batch_done", cli="*")
+
+    resp_a = _read_response(conv_id, "fake-a")
+    assert "COUNCIL_DSU_START" not in resp_a, (
+        f"armed DSU survived peer_sync off/on toggle: {resp_a[:400]}"
+    )
+
+
 def test_dsu_armed_event_emitted(client) -> None:
     r = client.post("/api/conversations")
     conv_id = r.json()["id"]
