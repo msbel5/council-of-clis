@@ -729,6 +729,16 @@ async def _run_send_action(msg: dict[str, Any], ws: WebSocket, conv: Conversatio
     Per-send locals replace v0.4-era `conv._last_rcs` and `conv._dsu_emitted_to`
     — the Codex audit flagged those as conversation-scoped (cross-send) races.
     """
+    # v0.5 Codex audit MUST-FIX: consume the DSU one-shot flag at the VERY
+    # start of the send action — BEFORE any validation gates (empty prompt,
+    # trust denial, unknown mode) can return early without it. Strict
+    # one-shot semantics: clicking "send" with DSU armed consumes the flag,
+    # period. If the send is then rejected for any reason, the user's DSU
+    # was "wasted" — but the next valid send is plain, and no exception
+    # anywhere in this function can leave a stale armed flag.
+    dsu_armed = conv.dsu_pending and conv.peer_sync_mode == "dsu"
+    if dsu_armed:
+        conv.set_dsu_pending(False)
     prompt = msg.get("prompt", "").strip()
     clis = msg.get("clis") or ["codex", "claude"]
     mode_name = msg.get("mode", "parallel")
@@ -805,16 +815,8 @@ async def _run_send_action(msg: dict[str, Any], ws: WebSocket, conv: Conversatio
     rcs: dict[str, int] = {}  # cli → exit code, populated by stream_cli via rc_sink
     dsu_emitted_to: set[str] = set()  # CLIs that have received their first-call DSU
 
-    # v0.5 Codex audit MUST-FIX: consume the DSU one-shot flag ATOMICALLY at
-    # send start (read + clear). Previously the flag was cleared only in the
-    # post-mode_fn `finally` block, so a pre-mode exception (e.g. trust check
-    # failure raised after dsu_armed was captured) could leave the flag set
-    # for an unrelated next send. Capturing locally also means the per-WS
-    # client's choice can't be "stolen" by an overlapping send because we
-    # hold _send_lock for the duration.
-    dsu_armed = conv.dsu_pending and conv.peer_sync_mode == "dsu"
-    if dsu_armed:
-        conv.set_dsu_pending(False)
+    # (DSU flag was already consumed at the very top of this function. The
+    # `dsu_armed` boolean captured there still drives whether we build blocks.)
     current_turn = conv.current_turn()
     dsu_blocks: dict[str, str] = {}
     if dsu_armed:
