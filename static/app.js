@@ -1,6 +1,8 @@
 // Council UI — WebSocket client for multi-CLI orchestration.
 
 const CLIS = ["codex", "claude", "copilot", "gemini"];
+const RECENTS_KEY = "council:recent-project-dirs";
+const MAX_RECENTS = 5;
 
 const state = {
   convId: null,
@@ -51,7 +53,10 @@ function buildPanes() {
           "button",
           {
             className: "pane-clear",
-            onClick: () => pane.querySelector(".pane-body").textContent = "",
+            onClick: () => {
+              pane.querySelector(".pane-body").textContent = "";
+              pane.classList.remove("pane-error");
+            },
           },
           "clear",
         ),
@@ -63,19 +68,30 @@ function buildPanes() {
 }
 
 function appendToPane(cli, kind, data) {
-  const pane = document.querySelector(`.pane[data-cli="${cli}"] .pane-body`);
-  if (!pane) return;
+  const paneEl = document.querySelector(`.pane[data-cli="${cli}"]`);
+  if (!paneEl) return;
+  const body = paneEl.querySelector(".pane-body");
   const span = document.createElement("span");
   span.className = `chunk-${kind}`;
   span.textContent = data;
-  pane.appendChild(span);
-  pane.scrollTop = pane.scrollHeight;
+  body.appendChild(span);
+  body.scrollTop = body.scrollHeight;
+  if (kind === "error") {
+    paneEl.classList.add("pane-error");
+    paneEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 }
 
-function appendStatus(msg, klass = "info") {
-  const log = document.getElementById("status-msg");
-  log.textContent = msg;
-  log.className = klass;
+function setRunStatus(kind, text) {
+  const wrap = document.getElementById("run-status");
+  const msg = document.getElementById("status-msg");
+  wrap.dataset.state = kind;
+  msg.textContent = text;
+}
+
+function appendStatus(text, klass = "info") {
+  const stateMap = { error: "error", phase: "phase", info: "info" };
+  setRunStatus(stateMap[klass] || "info", text);
 }
 
 // ---- API ----
@@ -93,13 +109,14 @@ async function newConversation() {
   const { id } = await api("/api/conversations", { method: "POST" });
   state.convId = id;
   document.getElementById("conv-id-display").textContent = id;
+  document.getElementById("conv-id-display").classList.add("active");
   if (state.ws) state.ws.close();
   state.ws = new WebSocket(`ws://${location.host}/ws/${id}`);
   state.ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.cli === "*") {
       if (m.kind === "trust_required") {
-        setInFlight(false);  // not actually running — waiting on user approval
+        setInFlight(false);
         document.getElementById("trust-target").textContent = m.data;
         document.getElementById("trust-reason").textContent = m.reason || "needs approval";
         const dlg = document.getElementById("trust-dialog");
@@ -111,17 +128,14 @@ async function newConversation() {
       if (m.kind === "batch_done" || m.kind === "error") {
         setInFlight(false);
       }
-      const cls = m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info";
-      appendStatus(`[${m.kind}] ${m.data}`, cls);
+      appendStatus(`[${m.kind}] ${m.data}`, m.kind === "error" ? "error" : m.kind === "phase" ? "phase" : "info");
       return;
     }
-    // Show label (round/phase tag) as a prefix on each chunk
     const tag = m.label ? `[${m.label}] ` : "";
     appendToPane(m.cli, m.kind, tag + m.data);
   };
   state.ws.onclose = () => appendStatus("ws closed", "info");
   state.ws.onerror = () => appendStatus("ws error", "error");
-  // wait for ws open
   await new Promise((resolve) => {
     state.ws.onopen = () => {
       appendStatus(`conversation ${id} ready`, "info");
@@ -133,7 +147,6 @@ async function newConversation() {
 async function loadClis() {
   const data = await api("/api/clis");
   state.availableClis = data.clis;
-  // Disable checkboxes for unavailable CLIs
   for (const cb of document.querySelectorAll("input[data-cli]")) {
     const name = cb.dataset.cli;
     const avail = state.availableClis[name]?.available;
@@ -174,9 +187,14 @@ async function send() {
   const mode = document.getElementById("mode-select").value;
   const includeStatus = document.getElementById("include-status").checked;
   const projectDir = document.getElementById("project-dir").value.trim();
-  // Remember last-used project dir
-  if (projectDir) localStorage.setItem("council:last-project-dir", projectDir);
+  if (projectDir) {
+    localStorage.setItem("council:last-project-dir", projectDir);
+    saveRecentDir(projectDir);
+  }
   setInFlight(true);
+  for (const p of document.querySelectorAll(".pane.pane-error")) {
+    p.classList.remove("pane-error");
+  }
   state.ws.send(
     JSON.stringify({
       action: "send",
@@ -187,7 +205,7 @@ async function send() {
       project_dir: projectDir,
     }),
   );
-  appendStatus(`mode=${mode} → ${clis.join(", ")} (cwd=${projectDir || "council"})...`, "info");
+  appendStatus(`mode=${mode} → ${clis.join(", ")} (cwd=${projectDir || "council"})`, "phase");
 }
 
 // ---- Trust ----
@@ -231,7 +249,7 @@ async function approveTrust(target) {
     });
     appendStatus(`approved: ${target}`, "info");
     document.getElementById("trust-dialog").close();
-    send();  // retry the prompt
+    send();
   } catch (err) {
     appendStatus(`approve failed: ${err.message}`, "error");
   }
@@ -255,16 +273,101 @@ async function saveStatus() {
   document.getElementById("status-dialog").close();
 }
 
+// ---- Recent project dirs ----
+
+function loadRecentDirs() {
+  try {
+    return JSON.parse(localStorage.getItem(RECENTS_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentDir(dir) {
+  if (!dir) return;
+  const next = [dir, ...loadRecentDirs().filter((x) => x !== dir)].slice(0, MAX_RECENTS);
+  localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  renderRecentDirs();
+}
+
+function renderRecentDirs() {
+  const dl = document.getElementById("recent-projects");
+  if (!dl) return;
+  dl.innerHTML = "";
+  for (const dir of loadRecentDirs()) {
+    dl.appendChild(el("option", { value: dir }));
+  }
+}
+
+function normalizeDroppedPath(raw) {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("file:///")) {
+    const decoded = decodeURIComponent(trimmed.slice("file:///".length));
+    if (/^[A-Za-z]:/.test(decoded)) return decoded.replaceAll("/", "\\");
+    return "/" + decoded;
+  }
+  if (trimmed.startsWith("file://")) {
+    return decodeURIComponent(trimmed.slice("file://".length));
+  }
+  if (/^[A-Za-z]:[\\/]/.test(trimmed)) return trimmed;
+  if (trimmed.startsWith("/")) return trimmed;
+  return "";
+}
+
+function wireProjectDirDnD() {
+  const input = document.getElementById("project-dir");
+  if (!input) return;
+  input.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    input.classList.add("drop-target");
+  });
+  input.addEventListener("dragleave", () => input.classList.remove("drop-target"));
+  input.addEventListener("drop", (e) => {
+    e.preventDefault();
+    input.classList.remove("drop-target");
+    const uri =
+      e.dataTransfer?.getData("text/uri-list") ||
+      e.dataTransfer?.getData("text/plain") ||
+      "";
+    const path = normalizeDroppedPath(uri.split("\n")[0]);
+    if (path) {
+      input.value = path;
+      appendStatus(`project folder set: ${path}`, "info");
+      updateProjectHint();
+    } else {
+      appendStatus("drop failed — paste absolute path instead", "error");
+    }
+  });
+  input.addEventListener("input", updateProjectHint);
+}
+
+function updateProjectHint() {
+  const input = document.getElementById("project-dir");
+  const hint = document.getElementById("project-hint");
+  if (!input || !hint) return;
+  if (input.value.trim()) {
+    hint.textContent = `cwd: ${input.value.trim()}`;
+    hint.classList.remove("muted");
+  } else {
+    hint.textContent = "using Council cwd";
+    hint.classList.add("muted");
+  }
+}
+
 // ---- Init ----
 
 window.addEventListener("DOMContentLoaded", async () => {
   buildPanes();
   await loadClis();
-  buildPanes(); // re-render with availability info
+  buildPanes();
 
-  // Restore last-used project dir
   const lastProjectDir = localStorage.getItem("council:last-project-dir");
   if (lastProjectDir) document.getElementById("project-dir").value = lastProjectDir;
+
+  renderRecentDirs();
+  wireProjectDirDnD();
+  updateProjectHint();
 
   document.getElementById("new-conv").addEventListener("click", newConversation);
   document.getElementById("send-btn").addEventListener("click", send);
