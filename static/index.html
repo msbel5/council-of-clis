@@ -8,7 +8,10 @@
 <body>
   <header>
     <h1>Council</h1>
-    <span class="subtitle">multi-CLI orchestrator for Alcyone</span>
+    <span class="subtitle">multi-CLI orchestrator</span>
+    <input type="text" id="project-dir" class="project-input"
+           placeholder="Project folder (e.g. C:\Users\...\alcyone-mind) — leave blank = Council cwd" />
+    <button id="trust-list" title="Manage trusted folders">🔒</button>
     <span class="conv-id" id="conv-id-display">no conversation</span>
     <button id="new-conv">+ New conversation</button>
     <button id="open-status">📋 Status block</button>
@@ -54,6 +57,30 @@
       <textarea id="status-editor" rows="20"></textarea>
       <div class="dialog-buttons">
         <button id="save-status" type="button">Save</button>
+        <button value="cancel">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="trust-dialog">
+    <form method="dialog">
+      <h2>🔒 Trust folder?</h2>
+      <p>Council needs your permission to spawn CLI subprocesses inside this folder.
+         Each CLI will see all files there. System paths (Windows, /etc, /usr) are blocked.</p>
+      <p><strong>Folder:</strong> <code id="trust-target">—</code></p>
+      <p><strong>Reason:</strong> <span id="trust-reason">—</span></p>
+      <div class="dialog-buttons">
+        <button id="trust-approve" type="button">Approve and continue</button>
+        <button value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="trust-list-dialog">
+    <form method="dialog">
+      <h2>🔒 Trusted folders</h2>
+      <ul id="trust-list-items"></ul>
+      <div class="dialog-buttons">
         <button value="cancel">Close</button>
       </div>
     </form>

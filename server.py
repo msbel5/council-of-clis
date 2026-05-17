@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import shutil
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -29,7 +28,11 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import trust
 from modes import MODES, ModeResult
+from registry import CLIEntry, ensure_user_config_seeded, load_registry
+from spawn import build_spawn_spec
+from spawn import spawn as spawn_subprocess
 
 # ---- Paths ------------------------------------------------------------------
 
@@ -49,56 +52,29 @@ if not STATUS_FILE.exists() and STATUS_EXAMPLE.exists():
     STATUS_FILE.write_text(STATUS_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+# ---- Validation helpers -----------------------------------------------------
+
+# conv_id is user-influenced (via WebSocket path + REST API). Validate hard against
+# any path-separator surprises before joining into CONVERSATIONS / conv_id.
+_CONV_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _validate_conv_id(conv_id: str) -> str:
+    """Return conv_id if safe, else raise HTTPException."""
+    if not conv_id or not _CONV_ID_PATTERN.match(conv_id) or len(conv_id) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid conversation id (expected [A-Za-z0-9_-]{1,64})",
+        )
+    return conv_id
+
+
 # ---- CLI registry -----------------------------------------------------------
-# Each entry: name -> (command_template, available_check, prompt_via_stdin)
-# command_template: argv list using "{prompt_file}" placeholder if file mode,
-#                   or argv list to pipe stdin if stdin mode.
-# prompt_via_stdin: True → pipe prompt to stdin; False → read from file argument
+# Loaded from default_clis.toml (package) + <platform-config>/Council/clis.toml (user).
+# See registry.py.
 
-# INVOCATION RULES (verified via Codex CLI research, 2026-05-17):
-#   codex exec -                  ← `-` is explicit stdin sentinel (Windows hang fix)
-#   claude --print "PROMPT"       ← prompt as argv; stdin is optional extra context
-#   copilot -sp "PROMPT"          ← new standalone Copilot CLI (NOT `gh copilot suggest`)
-#   gemini -p "PROMPT"            ← or pipe stdin
-
-CLIS: dict[str, dict[str, Any]] = {
-    "codex": {
-        # Use `-` to explicitly read prompt from stdin (avoids Windows non-interactive hang)
-        "command": [
-            "codex",
-            "exec",
-            "-",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--model",
-            "gpt-5.4",
-            "--config",
-            'model_reasoning_effort="medium"',
-        ],
-        "mode": "stdin",
-        "available": lambda: shutil.which("codex") is not None,
-    },
-    "claude": {
-        # Claude Code CLI: prompt as argv with --print flag, stdin reserved for context
-        "command": ["claude", "--print"],
-        "mode": "argv",
-        "available": lambda: shutil.which("claude") is not None,
-    },
-    "copilot": {
-        # NEW standalone GitHub Copilot CLI (not `gh copilot suggest` which is shell-only)
-        # Install: gh extension install github/gh-copilot OR npm i -g @github/copilot-cli
-        "command": ["copilot", "-sp"],
-        "mode": "argv",
-        "available": lambda: shutil.which("copilot") is not None,
-    },
-    "gemini": {
-        # Google's gemini-cli — npm install -g @google/gemini-cli
-        "command": ["gemini", "-p"],
-        "mode": "argv",
-        "available": lambda: shutil.which("gemini") is not None,
-    },
-}
+REGISTRY: dict[str, CLIEntry] = load_registry()
+ensure_user_config_seeded()
 
 
 # ---- Status injection -------------------------------------------------------
@@ -169,6 +145,8 @@ async def stream_cli(
     ws: WebSocket,
     conv: Conversation,
     label: str = "",
+    *,
+    cwd: Path | None = None,
 ) -> str:
     """Spawn one CLI subprocess, stream its stdout/stderr line-by-line over WS.
 
@@ -176,45 +154,38 @@ async def stream_cli(
                            "data": "...", "label": "<round/phase tag>"}.
     Saves the full response to conversations/<id>/responses/<cli>__<label>.md.
     Returns the captured stdout text so consensus/debate modes can chain it.
+
+    `cwd` is the project folder the conversation is bound to (trusted at routing time).
+    None means use Council's own working directory.
+
+    `prompt` is passed through verbatim — status injection happens in the dispatcher
+    (`run_cli_wrapped` in `ws_stream`) so this function never double-injects.
     """
-    spec = CLIS.get(cli)
-    if spec is None:
+    entry = REGISTRY.get(cli)
+    if entry is None:
         await ws.send_json({"cli": cli, "kind": "error", "data": "unknown CLI", "label": label})
         return ""
-    if not spec["available"]():
-        await ws.send_json(
-            {"cli": cli, "kind": "error", "data": "CLI not installed locally", "label": label}
-        )
+    if not entry.is_available():
+        reason = "disabled or non-headless" if entry.disabled or not entry.headless_supported \
+                 else "CLI not installed locally"
+        await ws.send_json({"cli": cli, "kind": "error", "data": reason, "label": label})
         return ""
 
-    cmd = list(spec["command"])
-    full_prompt = build_full_prompt(prompt)
-    mode = spec.get("mode", "stdin")
-    conv.write_event({"kind": "cli_start", "cli": cli, "cmd": " ".join(cmd), "mode": mode})
-
-    if mode == "stdin":
-        # Pipe prompt to stdin (codex exec -, gemini bare)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "TERM": "dumb"},
-        )
-        if proc.stdin is not None:
-            proc.stdin.write(full_prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
-    else:
-        # Pass prompt as positional argv (claude --print, copilot -sp, gemini -p)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            full_prompt,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "TERM": "dumb"},
-        )
+    spec = build_spawn_spec(entry, prompt, cwd=cwd or ROOT)
+    conv.write_event(
+        {
+            "kind": "cli_start",
+            "cli": cli,
+            "cmd": " ".join(spec.argv),
+            "mode": spec.invocation_mode,
+            "cwd": str(spec.cwd),
+        }
+    )
+    proc = await spawn_subprocess(spec)
+    if spec.invocation_mode == "stdin" and proc.stdin is not None:
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
 
     captured: list[str] = []
 
@@ -269,9 +240,17 @@ async def stream_cli(
 
 
 class SendRequest(BaseModel):
+    """Payload schema for /ws/{conv_id} action='send' messages.
+
+    Kept as documentation of the wire contract used by static/app.js. Not currently
+    consumed via FastAPI body parsing because the WebSocket payload is parsed manually.
+    """
+
     prompt: str = Field(min_length=1)
     clis: list[str] = Field(default_factory=lambda: ["codex", "claude"])
+    mode: str = "parallel"
     include_status: bool = True
+    project_dir: str = ""
 
 
 # ---- FastAPI app ------------------------------------------------------------
@@ -280,7 +259,7 @@ class SendRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     print(f"[Council] static={STATIC} prompts={PROMPTS_DIR} conversations={CONVERSATIONS}")
-    print(f"[Council] CLIs: { {k: v['available']() for k, v in CLIS.items()} }")
+    print(f"[Council] CLIs: { {n: e.is_available() for n, e in REGISTRY.items()} }")
     yield
 
 
@@ -297,10 +276,55 @@ async def index() -> HTMLResponse:
 async def list_clis() -> dict[str, Any]:
     return {
         "clis": {
-            name: {"available": spec["available"](), "command": spec["command"][0]}
-            for name, spec in CLIS.items()
+            entry.name: {
+                "available": entry.is_available(),
+                "command": entry.executable,
+                "experimental": entry.experimental,
+                "description": entry.description,
+                "homepage": entry.homepage,
+                "disabled": entry.disabled,
+            }
+            for entry in REGISTRY.values()
         }
     }
+
+
+@app.get("/api/trust")
+async def trust_list() -> dict[str, list[str]]:
+    return {"trusted": trust.list_trusted()}
+
+
+class TrustRequest(BaseModel):
+    project_dir: str = Field(min_length=1)
+    note: str = ""
+
+
+@app.post("/api/trust/check")
+async def trust_check(payload: TrustRequest) -> dict[str, Any]:
+    decision = trust.check(payload.project_dir)
+    return {
+        "canonical": str(decision.canonical),
+        "trusted": decision.is_trusted,
+        "reason": decision.reason,
+    }
+
+
+@app.post("/api/trust/approve")
+async def trust_approve(payload: TrustRequest) -> dict[str, Any]:
+    decision = trust.check(payload.project_dir)
+    if decision.reason.startswith("forbidden"):
+        raise HTTPException(status_code=400, detail=decision.reason)
+    if decision.reason.startswith("not-a-directory"):
+        raise HTTPException(status_code=400, detail=decision.reason)
+    trust.trust_folder(decision.canonical, note=payload.note)
+    return {"canonical": str(decision.canonical), "trusted": True}
+
+
+@app.post("/api/trust/revoke")
+async def trust_revoke(payload: TrustRequest) -> dict[str, bool]:
+    canonical = trust.canonicalize(payload.project_dir)
+    removed = trust.untrust_folder(canonical)
+    return {"removed": removed}
 
 
 @app.get("/api/status")
@@ -343,6 +367,7 @@ async def list_conversations() -> dict[str, list[dict[str, Any]]]:
 
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation(conv_id: str) -> dict[str, Any]:
+    conv_id = _validate_conv_id(conv_id)
     d = CONVERSATIONS / conv_id
     if not d.exists():
         raise HTTPException(status_code=404, detail="not found")
@@ -363,6 +388,10 @@ async def list_modes() -> dict[str, list[str]]:
 
 @app.websocket("/ws/{conv_id}")
 async def ws_stream(ws: WebSocket, conv_id: str) -> None:
+    # Validate before path-join. Reject obvious traversal at the boundary.
+    if not _CONV_ID_PATTERN.match(conv_id) or len(conv_id) > 64:
+        await ws.close(code=1008, reason="invalid conv_id")
+        return
     await ws.accept()
     conv = Conversation(conv_id)
     try:
@@ -378,9 +407,23 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             clis = msg.get("clis") or ["codex", "claude"]
             mode_name = msg.get("mode", "parallel")
             include_status = bool(msg.get("include_status", True))
+            project_dir_raw = msg.get("project_dir") or ""
             if not prompt:
                 await ws.send_json({"cli": "*", "kind": "error", "data": "empty prompt"})
                 continue
+            # Trust check on project_dir before any spawn.
+            decision = trust.check(project_dir_raw or None)
+            if not decision.is_trusted:
+                await ws.send_json(
+                    {
+                        "cli": "*",
+                        "kind": "trust_required",
+                        "data": str(decision.canonical),
+                        "reason": decision.reason,
+                    }
+                )
+                continue
+            conv_cwd = decision.canonical
             mode_fn = MODES.get(mode_name)
             if mode_fn is None:
                 await ws.send_json(
@@ -389,18 +432,38 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 continue
             conv.write_prompt(prompt)
             conv.write_event(
-                {"kind": "send", "prompt_len": len(prompt), "clis": clis, "mode": mode_name}
+                {
+                    "kind": "send",
+                    "prompt_len": len(prompt),
+                    "clis": clis,
+                    "mode": mode_name,
+                    "cwd": str(conv_cwd),
+                }
+            )
+            # Persist per-conversation manifest (project_dir, selected_clis, mode).
+            (conv.dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "project_dir": str(conv_cwd),
+                        "selected_clis": clis,
+                        "mode": mode_name,
+                        "include_status": include_status,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
             await ws.send_json(
                 {
                     "cli": "*",
                     "kind": "info",
-                    "data": f"mode={mode_name} → CLIs {clis}",
+                    "data": f"mode={mode_name} → CLIs {clis} (cwd={conv_cwd})",
                 }
             )
 
-            # Wrap stream_cli so modes get the captured text + status injection.
-            # Bind include_status via default arg to avoid B023 (loop-variable closure).
+            # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd.
+            # SOLE OWNER of status injection — stream_cli never re-injects.
+            # Bind via default args to avoid B023 (loop-variable closure).
             async def run_cli_wrapped(
                 cli: str,
                 sub_prompt: str,
@@ -409,15 +472,16 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 label: str = "",
                 *,
                 _inject: bool = include_status,
+                _cwd: Path = conv_cwd,
             ) -> str:
-                # Re-inject status when the mode hands a packaged prompt? Only on round 1.
-                # For internal rounds (label != "r1" and != ""), DO NOT re-inject — packaged
-                # prompts already include the original task.
+                # Inject status on round 1 / initial only — packaged multi-round prompts
+                # from modes.py already contain the original task and would double-prepend.
+                # If `_inject` is False the user explicitly disabled it; respect that.
                 if label in ("", "r1") and _inject:
                     final_prompt = build_full_prompt(sub_prompt, include_status=True)
                 else:
                     final_prompt = sub_prompt
-                return await stream_cli(cli, final_prompt, ws_in, conv_in, label)
+                return await stream_cli(cli, final_prompt, ws_in, conv_in, label, cwd=_cwd)
 
             try:
                 result: ModeResult = await mode_fn(
