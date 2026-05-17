@@ -179,7 +179,26 @@ class Conversation:
     @classmethod
     def new(cls) -> Conversation:
         cid = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
-        return cls(cid)
+        return cls.get_or_create(cid)
+
+    # Per-process registry of Conversation instances keyed by conv_id.
+    # Codex bot v0.4 P3: a fresh `Conversation(conv_id)` per WebSocket means two
+    # tabs (or a reconnect overlapping the old connection) on the same id get
+    # independent `_sessions_lock`s, defeating the asyncio.Lock that fixed the
+    # earlier write race. Routing all accesses through `get_or_create` ensures
+    # a single instance — and a single lock — per conv_id within this server
+    # process. Multi-process write contention would still need file locks; out
+    # of scope for v0.4 (Council runs one server process per user).
+    _INSTANCES: dict[str, Conversation] = {}
+
+    @classmethod
+    def get_or_create(cls, conv_id: str) -> Conversation:
+        existing = cls._INSTANCES.get(conv_id)
+        if existing is not None:
+            return existing
+        inst = cls(conv_id)
+        cls._INSTANCES[conv_id] = inst
+        return inst
 
 
 # ---- Subprocess streaming --------------------------------------------------
@@ -520,7 +539,9 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
         await ws.close(code=1008, reason="invalid conv_id")
         return
     await ws.accept()
-    conv = Conversation(conv_id)
+    # Use the per-process registry so two WebSocket connections on the same
+    # conv_id share one Conversation instance (and its session lock).
+    conv = Conversation.get_or_create(conv_id)
     try:
         while True:
             msg = await ws.receive_json()

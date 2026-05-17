@@ -87,14 +87,17 @@ def _select_command(
 ) -> tuple[str, ...]:
     """Return resume_command (with {session_id} substituted) if we have a session id
     and the entry supports resume; else the fresh command.
+
+    Substitution is **substring-aware**: both whole-token form `"{session_id}"`
+    AND embedded forms like `"--resume={session_id}"` or `"--session={session_id}"`
+    are supported (Codex bot v0.4 P2). Mirrors how option `{value}` rendering
+    handles the same shape via `OptionSpec.render_argv`.
     """
     if session_id and entry.supports_resume:
-        return tuple(
-            session_id if tok == "{session_id}" else tok
-            for tok in entry.resume_command
-        )
-    # Strip any stray {session_id} from the fresh command (defensive).
-    return tuple(tok for tok in entry.command if tok != "{session_id}")
+        return tuple(tok.replace("{session_id}", session_id) for tok in entry.resume_command)
+    # Strip any stray {session_id} from the fresh command (defensive). Substring
+    # strip too — a token like "--session={session_id}" becomes "--session=".
+    return tuple(tok.replace("{session_id}", "") for tok in entry.command)
 
 
 def build_spawn_spec(
@@ -147,13 +150,18 @@ def build_spawn_spec(
 
 
 def _resolve_argv_with_prompt(argv: tuple[str, ...], prompt: str) -> tuple[str, ...]:
-    """Substitute the literal "{prompt}" token in argv with the actual prompt.
+    """Substitute the "{prompt}" placeholder in argv with the actual prompt.
 
-    If no "{prompt}" token is present, the prompt is appended at the end (legacy
-    behavior — keeps backwards compat with CLIs declared before placeholders existed).
+    Substring-aware (mirrors `_select_command` v0.4): both whole-token form
+    `"{prompt}"` AND embedded forms like `"--prompt={prompt}"` are supported.
+
+    If no "{prompt}" placeholder is present anywhere, the prompt is appended at
+    the end (legacy behavior — keeps backwards compat with CLIs declared before
+    placeholders existed).
     """
-    if "{prompt}" in argv:
-        return tuple(prompt if t == "{prompt}" else t for t in argv)
+    has_placeholder = any("{prompt}" in tok for tok in argv)
+    if has_placeholder:
+        return tuple(tok.replace("{prompt}", prompt) for tok in argv)
     return (*argv, prompt)
 
 

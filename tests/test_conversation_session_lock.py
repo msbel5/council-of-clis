@@ -17,12 +17,19 @@ import pytest
 import server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_conversation_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the per-process Conversation._INSTANCES between tests so state
+    from one test doesn't leak into another via the singleton registry."""
+    monkeypatch.setattr(server.Conversation, "_INSTANCES", {})
+
+
 @pytest.fixture
 def isolated_conv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> server.Conversation:
     """A Conversation whose disk state lives in tmp_path."""
     monkeypatch.setattr(server, "CONVERSATIONS", tmp_path)
     conv_id = "lock-test-1"
-    return server.Conversation(conv_id)
+    return server.Conversation.get_or_create(conv_id)
 
 
 @pytest.mark.asyncio
@@ -67,6 +74,46 @@ async def test_repeated_writes_to_same_cli_keep_latest(
 
     on_disk = json.loads(isolated_conv.sessions_path.read_text(encoding="utf-8"))
     assert on_disk == {"codex": "third", "claude": "claude-1"}
+
+
+def test_get_or_create_returns_same_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex bot v0.4 P3: two WebSocket connections on the same conv_id must
+    share the same Conversation instance (and therefore the same lock).
+
+    Pre-fix: `Conversation(conv_id)` created a fresh instance each call. Two
+    tabs would each have their own `_sessions_lock` and race anyway.
+    Post-fix: `Conversation.get_or_create(conv_id)` returns the same object.
+    """
+    monkeypatch.setattr(server, "CONVERSATIONS", tmp_path)
+    a = server.Conversation.get_or_create("same-id")
+    b = server.Conversation.get_or_create("same-id")
+    assert a is b
+    assert a._sessions_lock is b._sessions_lock
+
+
+def test_get_or_create_different_ids_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Different conv_ids must yield different instances and separate locks."""
+    monkeypatch.setattr(server, "CONVERSATIONS", tmp_path)
+    a = server.Conversation.get_or_create("conv-A")
+    b = server.Conversation.get_or_create("conv-B")
+    assert a is not b
+    assert a._sessions_lock is not b._sessions_lock
+
+
+def test_new_uses_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Conversation.new()` creates a fresh id and registers it; calling
+    `get_or_create` with that id returns the same instance.
+    """
+    monkeypatch.setattr(server, "CONVERSATIONS", tmp_path)
+    fresh = server.Conversation.new()
+    looked_up = server.Conversation.get_or_create(fresh.id)
+    assert fresh is looked_up
 
 
 @pytest.mark.asyncio

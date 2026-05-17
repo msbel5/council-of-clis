@@ -16,7 +16,7 @@ heuristic is safe in practice.
 from __future__ import annotations
 
 from registry import CLIEntry
-from spawn import extract_session_id
+from spawn import _resolve_argv_with_prompt, _select_command, extract_session_id
 
 
 def _entry(pattern: str) -> CLIEntry:
@@ -109,3 +109,73 @@ def test_claude_style_capture() -> None:
 def test_empty_stdout_returns_none() -> None:
     entry = _entry(r"session_id:\s*([A-Za-z0-9]+)")
     assert extract_session_id(entry, "") is None
+
+
+# ---- v0.4 placeholder substitution (Codex bot P2 #5) ----------------------
+
+
+def _resumable(resume_cmd: tuple[str, ...]) -> CLIEntry:
+    return CLIEntry(
+        name="x",
+        command=("x",),
+        invocation_mode="argv",
+        resume_command=resume_cmd,
+        session_id_pattern=r"sid=([0-9a-f]+)",
+    )
+
+
+def test_select_command_replaces_whole_token_session_id() -> None:
+    """Existing form `"{session_id}"` as its own token (codex/claude/gemini style)."""
+    entry = _resumable(("foo", "--resume", "{session_id}", "--print"))
+    assert _select_command(entry, "abc123") == ("foo", "--resume", "abc123", "--print")
+
+
+def test_select_command_replaces_embedded_session_id() -> None:
+    """Codex bot P2: `--resume={session_id}` form must substitute inside the token.
+
+    Real CLIs like `gh` and many Go CLIs use the `--flag=value` joined form.
+    The pre-fix code left the literal placeholder in argv and the spawn would
+    fail with "unrecognized argument: --resume={session_id}".
+    """
+    entry = _resumable(("foo", "--resume={session_id}", "--print"))
+    assert _select_command(entry, "abc123") == ("foo", "--resume=abc123", "--print")
+
+
+def test_select_command_replaces_alternate_placeholders() -> None:
+    """`--session={session_id}` and other joined forms also work."""
+    entry = _resumable(("foo", "--session={session_id}"))
+    assert _select_command(entry, "xyz") == ("foo", "--session=xyz")
+
+
+def test_select_command_strips_embedded_placeholder_in_fresh_cmd() -> None:
+    """When no session id is known, the fresh `command` may contain a stray
+    `{session_id}` (defensive — the registry separates command/resume_command
+    but a user might paste a template into the wrong field). Strip embedded too.
+    """
+    # session_id=None → fall through to fresh command branch
+    entry = CLIEntry(
+        name="x",
+        command=("foo", "--session={session_id}", "--print"),
+        invocation_mode="argv",
+    )
+    out = _select_command(entry, None)
+    # "{session_id}" stripped inside the embedded token, leaves "--session="
+    assert "{session_id}" not in "".join(out)
+
+
+def test_resolve_argv_with_prompt_whole_token() -> None:
+    """Existing `"{prompt}"` as its own token (claude/gemini/copilot style)."""
+    out = _resolve_argv_with_prompt(("foo", "--print", "{prompt}"), "hello")
+    assert out == ("foo", "--print", "hello")
+
+
+def test_resolve_argv_with_prompt_embedded_token() -> None:
+    """Codex P2 consistency: `--prompt={prompt}` form must also substitute."""
+    out = _resolve_argv_with_prompt(("foo", "--prompt={prompt}"), "hello world")
+    assert out == ("foo", "--prompt=hello world")
+
+
+def test_resolve_argv_with_prompt_no_placeholder_appends() -> None:
+    """Legacy behavior: no `{prompt}` anywhere → append at end."""
+    out = _resolve_argv_with_prompt(("foo", "--print"), "hello")
+    assert out == ("foo", "--print", "hello")
