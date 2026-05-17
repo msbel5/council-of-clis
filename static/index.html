@@ -56,6 +56,14 @@
         <label class="status-toggle">
           <input type="checkbox" id="include-status" checked /> inject status
         </label>
+        <label class="status-toggle" title="When 'dsu', the 📡 Standup button shares each CLI's last response with the others on the next send.">
+          peer sync:
+          <select id="peer-sync-mode">
+            <option value="off" selected>off</option>
+            <option value="dsu">dsu</option>
+          </select>
+        </label>
+        <button id="dsu-load" type="button" class="dsu-btn" title="Queue a one-shot peer brief for the next send (DSU stand-up).">📡 Standup</button>
       </div>
       <textarea id="prompt-input" placeholder="Type your prompt (Ctrl+Enter to send)..." rows="6" spellcheck="false"></textarea>
       <run-status-bar id="run-status"></run-status-bar>

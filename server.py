@@ -37,7 +37,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import trust
+from dsu import build_dsu_block
 from modes import MODES, ModeResult
+from peer_log import PeerLogEntry, append_entries, latest_per_cli
 from registry import CLIEntry, ensure_user_config_seeded, load_registry
 from spawn import build_spawn_spec, extract_session_id
 from spawn import spawn as spawn_subprocess
@@ -99,19 +101,33 @@ def load_status() -> str:
     return ""
 
 
-def build_full_prompt(prompt: str, include_status: bool = True) -> str:
-    """Compose final prompt: status block + user prompt."""
-    if not include_status:
-        return prompt
-    status = load_status()
-    if not status:
-        return prompt
-    return (
-        "<!-- ALCYONE STATUS (injected by Council) -->\n"
-        + status
-        + "\n<!-- END STATUS -->\n\n"
-        + prompt
-    )
+def build_full_prompt(
+    prompt: str,
+    include_status: bool = True,
+    *,
+    dsu_block: str = "",
+) -> str:
+    """Compose final prompt: DSU block + status block + user prompt.
+
+    `dsu_block` is the rendered peer brief from `dsu.build_dsu_block` (empty
+    when no DSU was triggered, or when there are no peers to report on).
+    Order: DSU first (peer quoted notes), then status (project context),
+    then user prompt. CLIs read top-down so the DSU framing lands before
+    the user instruction it's contextualizing.
+    """
+    parts: list[str] = []
+    if dsu_block:
+        parts.append(dsu_block)
+        parts.append("")
+    if include_status:
+        status = load_status()
+        if status:
+            parts.append("<!-- ALCYONE STATUS (injected by Council) -->")
+            parts.append(status)
+            parts.append("<!-- END STATUS -->")
+            parts.append("")
+    parts.append(prompt)
+    return "\n".join(parts)
 
 
 # ---- Conversation persistence ----------------------------------------------
@@ -131,12 +147,20 @@ class Conversation:
         (self.dir / "responses").mkdir(exist_ok=True)
         self.log_path = self.dir / "events.jsonl"
         self.sessions_path = self.dir / "cli_sessions.json"
+        self.peer_log_path = self.dir / "peer_log.jsonl"  # v0.5
+        self.manifest_path = self.dir / "manifest.json"  # v0.5 (was inline JSON)
         # Serializes concurrent set_cli_session() in parallel modes — Codex bot
         # P2 v0.4: two CLIs finishing at the same moment would each read the
         # store, modify in-memory, and write — the loser's write overwrote the
         # winner's session id. Single lock per Conversation keeps the
         # load → modify → write atomic from the event loop's perspective.
         self._sessions_lock = asyncio.Lock()
+        # Manifest writes also load-modify-write; reuse same pattern.
+        self._manifest_lock = asyncio.Lock()
+        # One-shot DSU flag — set by `/dsu` action, consumed by the next send,
+        # cleared at the end of that send. Lives in-memory only (per-process
+        # Conversation singleton via get_or_create) since it's transient state.
+        self._dsu_pending = False
 
     def write_event(self, event: dict[str, Any]) -> None:
         event["ts"] = time.time()
@@ -175,6 +199,76 @@ class Conversation:
             self.sessions_path.write_text(
                 json.dumps(store, indent=2, sort_keys=True), encoding="utf-8"
             )
+
+    # ---- v0.5 manifest + peer log + DSU --------------------------------------
+
+    def load_manifest(self) -> dict[str, Any]:
+        """Load the conversation manifest (per-conversation settings)."""
+        if not self.manifest_path.exists():
+            return {}
+        try:
+            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def save_manifest(self, updates: dict[str, Any]) -> None:
+        """Merge `updates` into the manifest and persist. Lock-guarded for the
+        same reason `set_cli_session` is — parallel WS senders could clobber.
+        """
+        async with self._manifest_lock:
+            current = self.load_manifest()
+            current.update(updates)
+            self.manifest_path.write_text(
+                json.dumps(current, indent=2, sort_keys=True), encoding="utf-8"
+            )
+
+    @property
+    def peer_sync_mode(self) -> str:
+        """Current peer-sync mode: "off" (default) or "dsu"."""
+        return str(self.load_manifest().get("peer_sync_mode", "off"))
+
+    @property
+    def peer_budget_tokens(self) -> int:
+        """Token budget per peer in the DSU block. Default 64."""
+        try:
+            return int(self.load_manifest().get("peer_budget_tokens", 64))
+        except (TypeError, ValueError):
+            return 64
+
+    @property
+    def dsu_pending(self) -> bool:
+        """True if the user triggered DSU and the next send should inject."""
+        return self._dsu_pending
+
+    def set_dsu_pending(self, flag: bool) -> None:
+        """Set/clear the one-shot DSU flag."""
+        self._dsu_pending = bool(flag)
+
+    def write_peer_log(self, entries: list[PeerLogEntry]) -> None:
+        """Append a turn's worth of peer-log entries (one per CLI)."""
+        if entries:
+            append_entries(self.peer_log_path, entries)
+
+    def current_turn(self) -> int:
+        """Count of previous turns based on the peer log. First turn returns 1."""
+        if not self.peer_log_path.exists():
+            return 1
+        # Lightweight count — one line per entry; turn count is max(turn) + 1.
+        try:
+            text = self.peer_log_path.read_text(encoding="utf-8")
+        except OSError:
+            return 1
+        max_turn = 0
+        for line in text.splitlines():
+            try:
+                data = json.loads(line)
+                t = int(data.get("turn", 0))
+                if t > max_turn:
+                    max_turn = t
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return max_turn + 1
 
     @classmethod
     def new(cls) -> Conversation:
@@ -545,10 +639,60 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
     try:
         while True:
             msg = await ws.receive_json()
+            action = msg.get("action")
+            # v0.5: handle DSU + manifest actions before the send path.
+            if action == "dsu_load":
+                # One-shot: arm the flag, next send will inject the peer brief.
+                # No-op if peer_sync_mode != "dsu" (so this is safe even if the
+                # user clicks the button before enabling DSU in settings).
+                if conv.peer_sync_mode != "dsu":
+                    await ws.send_json(
+                        {
+                            "cli": "*",
+                            "kind": "dsu_skipped",
+                            "data": "peer_sync_mode is 'off' — enable DSU in settings first",
+                        }
+                    )
+                    continue
+                conv.set_dsu_pending(True)
+                await ws.send_json(
+                    {
+                        "cli": "*",
+                        "kind": "dsu_armed",
+                        "data": "DSU peer brief queued for next send",
+                    }
+                )
+                continue
+            if action == "set_peer_sync":
+                # Update the manifest live: {"action": "set_peer_sync",
+                #                            "mode": "dsu"|"off",
+                #                            "budget_tokens": <int>}
+                updates: dict[str, Any] = {}
+                pm = msg.get("mode")
+                if pm in ("off", "dsu"):
+                    updates["peer_sync_mode"] = pm
+                bt = msg.get("budget_tokens")
+                if isinstance(bt, int) and 8 <= bt <= 1024:
+                    updates["peer_budget_tokens"] = bt
+                if updates:
+                    await conv.save_manifest(updates)
+                await ws.send_json(
+                    {
+                        "cli": "*",
+                        "kind": "peer_sync_updated",
+                        "data": json.dumps(
+                            {
+                                "peer_sync_mode": conv.peer_sync_mode,
+                                "peer_budget_tokens": conv.peer_budget_tokens,
+                            }
+                        ),
+                    }
+                )
+                continue
             # Expected: {"action": "send", "prompt": "...", "clis": [...],
             #            "mode": "parallel|debate|cascade|moa|router|consensus",
             #            "include_status": true}
-            if msg.get("action") != "send":
+            if action != "send":
                 await ws.send_json({"cli": "*", "kind": "error", "data": "unknown action"})
                 continue
             prompt = msg.get("prompt", "").strip()
@@ -597,18 +741,16 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 }
             )
             # Persist per-conversation manifest (project_dir, selected_clis, mode, options).
-            (conv.dir / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "project_dir": str(conv_cwd),
-                        "selected_clis": clis,
-                        "mode": mode_name,
-                        "include_status": include_status,
-                        "cli_options": cli_options,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
+            # Use save_manifest to preserve peer_sync_mode/peer_budget_tokens that may
+            # already be set in the file from earlier /set_peer_sync calls.
+            await conv.save_manifest(
+                {
+                    "project_dir": str(conv_cwd),
+                    "selected_clis": clis,
+                    "mode": mode_name,
+                    "include_status": include_status,
+                    "cli_options": cli_options,
+                }
             )
             await ws.send_json(
                 {
@@ -621,6 +763,32 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
             # Snapshot per-CLI session ids saved from prior turns. We read once here
             # (not per spawn) so all CLIs in this send agree on what they're resuming.
             cli_sessions = conv.load_cli_sessions()
+
+            # v0.5 DSU: if the user armed a peer brief AND peer_sync_mode == "dsu",
+            # render the brief ONCE here per receiver. The block is per-receiver
+            # because each CLI gets a version with its OWN entry filtered out
+            # (we never echo a CLI back its own last response — `--resume` already
+            # carries that. See peer_log.latest_per_cli(exclude=cli)).
+            dsu_armed = conv.dsu_pending and conv.peer_sync_mode == "dsu"
+            current_turn = conv.current_turn()
+            dsu_blocks: dict[str, str] = {}
+            if dsu_armed:
+                budget = conv.peer_budget_tokens
+                for cli_name in clis:
+                    peers = latest_per_cli(conv.peer_log_path, exclude=cli_name)
+                    dsu_blocks[cli_name] = build_dsu_block(
+                        turn=current_turn, peers=peers, budget_tokens=budget
+                    )
+                conv.write_event(
+                    {
+                        "kind": "dsu_inject",
+                        "turn": current_turn,
+                        "budget": budget,
+                        "non_empty_receivers": [
+                            c for c, b in dsu_blocks.items() if b
+                        ],
+                    }
+                )
 
             # Wrap stream_cli so modes get a single, fully-prepared prompt + cwd + options
             # + session_id. SOLE OWNER of status injection — stream_cli never re-injects.
@@ -636,9 +804,15 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 _cwd: Path = conv_cwd,
                 _opts: dict[str, dict[str, object]] = cli_options,
                 _sessions: dict[str, str] = cli_sessions,
+                _dsu_blocks: dict[str, str] = dsu_blocks,
             ) -> str:
-                if label in ("", "r1") and _inject:
-                    final_prompt = build_full_prompt(sub_prompt, include_status=True)
+                # DSU block only on the FIRST round (label=="" or "r1") — within-mode
+                # rounds already pack peers via mode helpers, no need to double-state.
+                dsu = _dsu_blocks.get(cli, "") if label in ("", "r1") else ""
+                if label in ("", "r1") and (_inject or dsu):
+                    final_prompt = build_full_prompt(
+                        sub_prompt, include_status=_inject, dsu_block=dsu
+                    )
                 else:
                     final_prompt = sub_prompt
                 return await stream_cli(
@@ -669,6 +843,29 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                     (conv.dir / "final.md").write_text(
                         result["final_text"], encoding="utf-8"
                     )
+                # v0.5: persist this turn's peer log — one entry per CLI using the
+                # CLI's FINAL per-send response (last element of its history).
+                # `from_response` strips any embedded COUNCIL_DSU_* markers so a
+                # CLI that quoted the previous turn's brief doesn't recurse.
+                turn_no = current_turn  # captured above before mode_fn ran
+                peer_entries: list[PeerLogEntry] = []
+                for cli_name, history in result["per_cli_history"].items():
+                    if not history:
+                        continue
+                    final_text = history[-1]
+                    is_error = bool(
+                        isinstance(final_text, str) and final_text.startswith("[error:")
+                    )
+                    peer_entries.append(
+                        PeerLogEntry.from_response(
+                            turn=turn_no,
+                            cli=cli_name,
+                            mode=result["mode"],
+                            text=str(final_text),
+                            error=is_error,
+                        )
+                    )
+                conv.write_peer_log(peer_entries)
                 summary = (
                     f"mode={result['mode']} rounds={result['rounds']} "
                     f"final={len(result['final_text'])}c"
@@ -681,6 +878,12 @@ async def ws_stream(ws: WebSocket, conv_id: str) -> None:
                 await ws.send_json(
                     {"cli": "*", "kind": "error", "data": f"mode failed: {e}"}
                 )
+            finally:
+                # One-shot DSU semantics: regardless of success/failure, this
+                # send consumed the trigger. Next turn is plain unless the user
+                # rearms via /dsu_load.
+                if dsu_armed:
+                    conv.set_dsu_pending(False)
     except WebSocketDisconnect:
         return
 

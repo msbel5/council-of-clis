@@ -377,6 +377,27 @@ async function pickFolder() {
   }
 }
 
+// ---- DSU (v0.5 peer awareness) ----
+
+function dsuLoad() {
+  if (!state.ws || state.ws.readyState !== 1) {
+    appendStatus("no active conversation — start one before triggering DSU", "error");
+    return;
+  }
+  state.ws.send(JSON.stringify({ action: "dsu_load" }));
+}
+
+function setPeerSync() {
+  const sel = document.getElementById("peer-sync-mode");
+  if (!state.ws || state.ws.readyState !== 1) {
+    appendStatus("no active conversation — change applied on next start", "info");
+    return;
+  }
+  state.ws.send(
+    JSON.stringify({ action: "set_peer_sync", mode: sel.value, budget_tokens: 64 }),
+  );
+}
+
 // ---- Init ----
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -395,6 +416,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("save-status").addEventListener("click", saveStatus);
   document.getElementById("trust-list").addEventListener("click", openTrustList);
   document.getElementById("browse-folder").addEventListener("click", pickFolder);
+  document.getElementById("dsu-load").addEventListener("click", dsuLoad);
+  document.getElementById("peer-sync-mode").addEventListener("change", setPeerSync);
 
   // Listen for component events
   document.addEventListener("cli-card:toggle", (e) => {
