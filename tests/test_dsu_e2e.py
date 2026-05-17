@@ -33,13 +33,15 @@ PYTHON = sys.executable
 
 
 def _fake_entry(name: str = "fake-a") -> CLIEntry:
-    """Argv-mode fake CLI so prompts land in cli_start.cmd for inspection."""
+    """Argv-mode fake CLI with FULL prompt echo so DSU assertions can inspect
+    what Council actually passed to each CLI.
+    """
     return CLIEntry(
         name=name,
         command=(PYTHON, str(FAKE_HELPER), "{prompt}"),
         invocation_mode="argv",
         headless_supported=True,
-        env={"FAKE_CLI_NAME": name},
+        env={"FAKE_CLI_NAME": name, "FAKE_CLI_ECHO_FULL": "1"},
         resume_command=(PYTHON, str(FAKE_HELPER), "--resume", "{session_id}", "{prompt}"),
         session_id_pattern=r"session_id:\s*([A-Za-z0-9]+)",
     )
@@ -102,16 +104,29 @@ def _read_cli_starts(conv_id: str) -> list[dict]:
     return starts
 
 
-def _read_response(conv_id: str, cli: str, label: str = "") -> str:
-    """Read what the fake CLI captured as its stdout. fake_cli echoes the
-    incoming prompt verbatim with `[name] | <line>` prefix, so we can verify
-    what Council actually passed in (including any injected DSU block).
+def _read_response(conv_id: str, cli: str) -> str:
+    """Read what the fake CLI captured as its stdout.
+
+    Parallel mode passes `label="r1"` for symmetry with multi-round modes, so
+    the file lands at `responses/{cli}__r1.md`. We pick the most-recently-
+    modified file matching `{cli}*.md` so the caller doesn't have to know
+    the mode's internal labeling convention.
+
+    fake_cli echoes the incoming prompt verbatim with `[name] | <line>` per
+    line, so DSU blocks and full prompt structure are visible in the returned
+    text.
     """
-    suffix = f"__{label}" if label else ""
-    path = server.CONVERSATIONS / conv_id / "responses" / f"{cli}{suffix}.md"
-    if not path.exists():
+    dir_path = server.CONVERSATIONS / conv_id / "responses"
+    if not dir_path.exists():
         return ""
-    return path.read_text(encoding="utf-8")
+    matches = sorted(
+        dir_path.glob(f"{cli}*.md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not matches:
+        return ""
+    return matches[0].read_text(encoding="utf-8")
 
 
 # ---- Default state --------------------------------------------------------
@@ -300,7 +315,7 @@ def test_dsu_skips_failed_cli(client, monkeypatch) -> None:
         name="fake-b",
         command=(PYTHON, str(FAKE_HELPER), "{prompt}"),
         invocation_mode="argv",
-        env={"FAKE_CLI_NAME": "fake-b", "FAKE_CLI_FAIL": "1"},
+        env={"FAKE_CLI_NAME": "fake-b", "FAKE_CLI_FAIL": "1", "FAKE_CLI_ECHO_FULL": "1"},
         resume_command=(PYTHON, str(FAKE_HELPER), "--resume", "{session_id}", "{prompt}"),
         session_id_pattern=r"session_id:\s*([A-Za-z0-9]+)",
     )
