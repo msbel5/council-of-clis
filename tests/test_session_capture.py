@@ -51,7 +51,7 @@ def test_prefers_last_match_not_first() -> None:
     This is the exact Codex P2 scenario: model talks about session_id in its
     answer, then the CLI runtime emits its own footer below.
     """
-    entry = _entry(r"session_id:\s*([A-Za-z0-9]+)")
+    entry = _entry(r"session_id:\s*(\w+)")  # \w includes underscore
     stdout = (
         "Here is some advice:\n"
         "  You can resume a session with `myctl --session_id: bogusFromModel`\n"
@@ -66,7 +66,7 @@ def test_tail_scan_ignores_far_history() -> None:
     not poison capture if it's beyond the 4 KB tail window AND there's a real
     match in the tail.
     """
-    entry = _entry(r"session_id:\s*([A-Za-z0-9]+)")
+    entry = _entry(r"session_id:\s*(\w+)")
     head = "session_id: POISONED_far_above\n" + ("filler\n" * 1000)
     tail = "session_id: TAIL_REAL_id\n"
     assert extract_session_id(entry, head + tail) == "TAIL_REAL_id"
