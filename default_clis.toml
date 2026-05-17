@@ -1,4 +1,4 @@
-# Council — built-in CLI registry (v0.2).
+# Council — built-in CLI registry (v0.3).
 #
 # Users can override or extend this in `<platform-config-dir>/council/clis.toml`.
 # On Windows: %APPDATA%\Council\clis.toml
@@ -7,54 +7,123 @@
 #
 # Each [[cli]] entry is validated by council.registry.CLIEntry.
 # Argv is always an array — never a shell string — to avoid escaping issues.
+#
+# Placeholders in `command`:
+#   "{options}"  → spawn.apply_options() substitutes the option tokens at this index
+#                  (placed BEFORE the prompt flag to avoid stealing -p / --prompt slots)
+#   "{prompt}"   → spawn._resolve_argv_with_prompt() substitutes the user prompt
+#                  (argv mode only; stdin-mode CLIs strip this token if present)
+#
+# options_schema: per-CLI option specs. The UI renders these as form controls,
+# spawn templates the chosen value into the argv tokens at spawn time
+# ("{value}" placeholder is replaced; never shell-parsed).
+
+# ---- Codex (OpenAI) -------------------------------------------------------
 
 [[cli]]
 name = "codex"
-command = [
-    "codex", "exec", "-",
-    "--skip-git-repo-check",
-    "--sandbox", "read-only",
-    "--model", "gpt-5.4",
-    "--config", 'model_reasoning_effort="medium"',
-]
-invocation_mode = "stdin"   # stdin | argv | file
+command = ["codex", "exec", "-", "--skip-git-repo-check", "{options}"]
+invocation_mode = "stdin"
 headless_supported = true
 experimental = false
 description = "OpenAI Codex CLI — requires ChatGPT Plus/Team/Business."
 homepage = "https://developers.openai.com/codex/cli"
 
+[[cli.options_schema]]
+name = "model"
+type = "enum"
+choices = ["gpt-5.4", "gpt-5.5"]
+default = "gpt-5.4"
+argv = ["--model", "{value}"]
+description = "Model variant."
+
+[[cli.options_schema]]
+name = "reasoning"
+type = "enum"
+choices = ["low", "medium", "high", "xhigh"]
+default = "medium"
+argv = ["--config", 'model_reasoning_effort="{value}"']
+description = "Reasoning effort level."
+
+[[cli.options_schema]]
+name = "sandbox"
+type = "enum"
+choices = ["read-only", "workspace-write", "disabled"]
+default = "read-only"
+argv = ["--sandbox", "{value}"]
+description = "Filesystem sandbox policy."
+
+# ---- Claude (Anthropic) ---------------------------------------------------
+
 [[cli]]
 name = "claude"
-command = ["claude", "--print"]
+command = ["claude", "{options}", "--print", "{prompt}"]
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
 description = "Anthropic Claude Code CLI — requires Claude Pro or Max."
 homepage = "https://code.claude.com/docs/en/cli-usage"
 
+[[cli.options_schema]]
+name = "model"
+type = "enum"
+choices = ["sonnet-4-5", "opus-4-7", "haiku-4-5"]
+default = "sonnet-4-5"
+argv = ["--model", "{value}"]
+description = "Claude model."
+
+[[cli.options_schema]]
+name = "output_format"
+type = "enum"
+choices = ["text", "json", "stream-json"]
+default = "text"
+argv = ["--output-format", "{value}"]
+description = "Reply format."
+
+# ---- GitHub Copilot CLI ---------------------------------------------------
+
 [[cli]]
 name = "copilot"
-command = ["copilot", "-sp"]
+command = ["copilot", "-sp", "{prompt}"]
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
 description = "GitHub Copilot CLI (new standalone, NOT `gh copilot suggest`)."
 homepage = "https://docs.github.com/en/copilot/how-tos/copilot-cli/cli-getting-started"
 
+# (No documented per-conversation options yet — leave empty.)
+
+# ---- Gemini (Google) ------------------------------------------------------
+
 [[cli]]
 name = "gemini"
-command = ["gemini", "-p"]
+command = ["gemini", "{options}", "-p", "{prompt}"]
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
 description = "Google Gemini CLI — requires Google AI Pro or API key."
 homepage = "https://google-gemini.github.io/gemini-cli/docs/cli/headless.html"
 
-# --- v0.3 candidates (Codex-verified May 17, 2026, not yet enabled by default) ---
+[[cli.options_schema]]
+name = "model"
+type = "enum"
+choices = ["gemini-2.5-pro", "gemini-2.5-flash"]
+default = "gemini-2.5-pro"
+argv = ["--model", "{value}"]
+description = "Gemini model."
+
+[[cli.options_schema]]
+name = "yolo"
+type = "bool"
+default = false
+argv = ["--yolo"]
+description = "Skip interactive confirmations."
+
+# ---- v0.3 candidates (Codex-verified May 17, 2026, experimental) ----------
 
 [[cli]]
 name = "grok"
-command = ["grok", "-p"]
+command = ["grok", "{options}", "-p", "{prompt}"]
 invocation_mode = "argv"
 headless_supported = true
 experimental = true
@@ -63,9 +132,26 @@ homepage = "https://x.ai/news/grok-build-cli"
 
 [[cli]]
 name = "vibe"
-command = ["vibe", "--prompt"]
+command = ["vibe", "{options}", "--prompt", "{prompt}"]
 invocation_mode = "argv"
 headless_supported = true
 experimental = true
 description = "Mistral Vibe terminal — supports --output json|streaming, --max-turns."
 homepage = "https://docs.mistral.ai/mistral-vibe/terminal/quickstart"
+
+[[cli.options_schema]]
+name = "output"
+type = "enum"
+choices = ["text", "json", "streaming"]
+default = "text"
+argv = ["--output", "{value}"]
+description = "Output format."
+
+[[cli.options_schema]]
+name = "max_turns"
+type = "number"
+default = 3
+min = 1
+max = 20
+argv = ["--max-turns", "{value}"]
+description = "Max conversation turns."
