@@ -180,3 +180,78 @@ def test_build_spawn_spec_threads_options(tmp_path: object) -> None:
     assert spec.argv == ("codex", "exec", "-", "--model", "b")
     assert spec.cli_name == "foo"
     assert spec.invocation_mode == "argv"
+
+
+# ---- {options} / {prompt} placeholder regression tests (Codex bot P1 fix) ----
+
+
+def test_options_placeholder_spliced_in_position() -> None:
+    """Options replace {options} token, preserving everything after."""
+    entry = CLIEntry(
+        name="gemini",
+        command=("gemini", "{options}", "-p", "{prompt}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="model", type="enum", argv=("--model", "{value}"),
+                       choices=("a",), default="a"),
+        ),
+    )
+    # With options
+    assert apply_options(entry, {"model": "a"}) == (
+        "gemini", "--model", "a", "-p", "{prompt}",
+    )
+    # Without options
+    assert apply_options(entry, {}) == ("gemini", "-p", "{prompt}")
+
+
+def test_no_options_placeholder_appends_at_end() -> None:
+    """Legacy CLIs without {options} still get extras appended at end."""
+    entry = CLIEntry(
+        name="foo",
+        command=("foo",),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="m", type="enum", argv=("--m", "{value}"),
+                       choices=("a",), default="a"),
+        ),
+    )
+    assert apply_options(entry, {"m": "a"}) == ("foo", "--m", "a")
+
+
+def test_spawn_prompt_placeholder_substituted() -> None:
+    """spawn._resolve_argv_with_prompt substitutes {prompt} → actual prompt."""
+    from spawn import _resolve_argv_with_prompt
+
+    argv = ("gemini", "--model", "x", "-p", "{prompt}")
+    assert _resolve_argv_with_prompt(argv, "hi") == (
+        "gemini", "--model", "x", "-p", "hi",
+    )
+
+
+def test_spawn_prompt_appended_when_no_placeholder() -> None:
+    """Legacy: no {prompt} in argv → prompt appended at end."""
+    from spawn import _resolve_argv_with_prompt
+
+    argv = ("foo", "--flag")
+    assert _resolve_argv_with_prompt(argv, "hi") == ("foo", "--flag", "hi")
+
+
+def test_gemini_p_flag_gets_prompt_not_options() -> None:
+    """Regression for Codex bot P1: `gemini -p` must consume the prompt, not --model."""
+    from spawn import _resolve_argv_with_prompt
+
+    entry = CLIEntry(
+        name="gemini",
+        command=("gemini", "{options}", "-p", "{prompt}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="model", type="enum", argv=("--model", "{value}"),
+                       choices=("gemini-2.5-pro",), default="gemini-2.5-pro"),
+        ),
+    )
+    after_options = apply_options(entry, {"model": "gemini-2.5-pro"})
+    assert after_options == ("gemini", "--model", "gemini-2.5-pro", "-p", "{prompt}")
+    after_prompt = _resolve_argv_with_prompt(after_options, "what is 2+2")
+    # The token immediately after -p must be the user prompt, NOT --model.
+    p_idx = after_prompt.index("-p")
+    assert after_prompt[p_idx + 1] == "what is 2+2"

@@ -28,17 +28,27 @@ class SpawnSpec:
 
 
 def apply_options(entry: CLIEntry, options: Mapping[str, object]) -> tuple[str, ...]:
-    """Return the entry's base argv with option-specified extras appended.
+    """Return the entry's command with option-specified extras spliced in.
+
+    Splice rule (Codex bot P1 fix):
+    - If the command contains a literal "{options}" token, the extras list replaces
+      that token (preserving everything that comes after, like "{prompt}" or a
+      prompt-taking flag pair).
+    - If no "{options}" placeholder, extras append at the end (legacy behavior; OK
+      for stdin-mode CLIs and for argv-mode CLIs that don't have a flag whose value
+      IS the prompt).
+
+    This matters because some argv-mode CLIs use a flag like ``gemini -p <prompt>``
+    or ``vibe --prompt <prompt>`` where the prompt is consumed as the flag's value.
+    Appending option tokens after such a flag steals the slot meant for the prompt.
 
     Only options that appear in `entry.options_schema` are honored. Unknown option
-    names are ignored (logged as a warning by the caller, not raised here, so a stale
-    UI selection doesn't crash a spawn). For each known option:
+    names are ignored so a stale UI selection doesn't crash a spawn. Per type:
 
-    - bool: include the argv if value is truthy, skip if falsy
-    - enum / number / string: substitute {value} placeholder(s) in the argv tokens
+    - bool   → include the argv tokens if value is truthy, skip if falsy
+    - enum / number / string → substitute {value} placeholder(s) in the argv tokens
 
-    All values are coerced + validated via `OptionSpec.coerce_value` (raises
-    RegistryError on bad input).
+    Raises `RegistryError` on bad input (validated via `OptionSpec.coerce_value`).
     """
     extras: list[str] = []
     for opt in entry.options_schema:
@@ -53,6 +63,15 @@ def apply_options(entry: CLIEntry, options: Mapping[str, object]) -> tuple[str, 
                 extras.extend(opt.argv)
         else:
             extras.extend(opt.render_argv(coerced))
+
+    if "{options}" in entry.command:
+        result: list[str] = []
+        for tok in entry.command:
+            if tok == "{options}":
+                result.extend(extras)
+            else:
+                result.append(tok)
+        return tuple(result)
     return tuple([*entry.command, *extras])
 
 
@@ -86,6 +105,17 @@ def build_spawn_spec(
     )
 
 
+def _resolve_argv_with_prompt(argv: tuple[str, ...], prompt: str) -> tuple[str, ...]:
+    """Substitute the literal "{prompt}" token in argv with the actual prompt.
+
+    If no "{prompt}" token is present, the prompt is appended at the end (legacy
+    behavior — keeps backwards compat with CLIs declared before placeholders existed).
+    """
+    if "{prompt}" in argv:
+        return tuple(prompt if t == "{prompt}" else t for t in argv)
+    return (*argv, prompt)
+
+
 async def spawn(spec: SpawnSpec) -> asyncio.subprocess.Process:
     """Actually launch the subprocess.
 
@@ -93,8 +123,11 @@ async def spawn(spec: SpawnSpec) -> asyncio.subprocess.Process:
     handling stdin (for stdin mode), and waiting/cancelling.
     """
     if spec.invocation_mode == "stdin":
+        # stdin mode: prompt goes through PIPE, never the argv. Any "{prompt}"
+        # placeholder still in the argv would be passed as a literal — strip it.
+        clean_argv = tuple(t for t in spec.argv if t != "{prompt}")
         return await asyncio.create_subprocess_exec(
-            *spec.argv,
+            *clean_argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -102,9 +135,9 @@ async def spawn(spec: SpawnSpec) -> asyncio.subprocess.Process:
             cwd=str(spec.cwd),
         )
     if spec.invocation_mode == "argv":
+        resolved = _resolve_argv_with_prompt(spec.argv, spec.prompt)
         return await asyncio.create_subprocess_exec(
-            *spec.argv,
-            spec.prompt,
+            *resolved,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
