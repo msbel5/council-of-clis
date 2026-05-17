@@ -186,8 +186,12 @@ def test_build_spawn_spec_threads_options(tmp_path: object) -> None:
 
 
 def test_options_placeholder_spliced_in_position() -> None:
-    """Options replace {options} token, preserving everything after."""
-    entry = CLIEntry(
+    """Options replace {options} token, preserving everything after.
+
+    Schema defaults now apply when the user omits an option (Codex bot P1 #2).
+    Use default=None to test the 'no defaults to apply' case explicitly.
+    """
+    entry_with_default = CLIEntry(
         name="gemini",
         command=("gemini", "{options}", "-p", "{prompt}"),
         invocation_mode="argv",
@@ -196,12 +200,26 @@ def test_options_placeholder_spliced_in_position() -> None:
                        choices=("a",), default="a"),
         ),
     )
-    # With options
-    assert apply_options(entry, {"model": "a"}) == (
+    # Explicit value
+    assert apply_options(entry_with_default, {"model": "a"}) == (
         "gemini", "--model", "a", "-p", "{prompt}",
     )
-    # Without options
-    assert apply_options(entry, {}) == ("gemini", "-p", "{prompt}")
+    # No value → default kicks in (this is the desired safety behavior)
+    assert apply_options(entry_with_default, {}) == (
+        "gemini", "--model", "a", "-p", "{prompt}",
+    )
+
+    # default=None → no fallback
+    entry_no_default = CLIEntry(
+        name="gemini",
+        command=("gemini", "{options}", "-p", "{prompt}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="model", type="enum", argv=("--model", "{value}"),
+                       choices=("a",), default=None),
+        ),
+    )
+    assert apply_options(entry_no_default, {}) == ("gemini", "-p", "{prompt}")
 
 
 def test_no_options_placeholder_appends_at_end() -> None:
