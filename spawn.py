@@ -82,6 +82,24 @@ def apply_options(entry: CLIEntry, options: Mapping[str, object]) -> tuple[str, 
     return tuple([*entry.command, *extras])
 
 
+def _select_command(
+    entry: CLIEntry, session_id: str | None
+) -> tuple[str, ...]:
+    """Return resume_command (with {session_id} substituted) if we have a session id
+    and the entry supports resume; else the fresh command.
+
+    Substitution is **substring-aware**: both whole-token form `"{session_id}"`
+    AND embedded forms like `"--resume={session_id}"` or `"--session={session_id}"`
+    are supported (Codex bot v0.4 P2). Mirrors how option `{value}` rendering
+    handles the same shape via `OptionSpec.render_argv`.
+    """
+    if session_id and entry.supports_resume:
+        return tuple(tok.replace("{session_id}", session_id) for tok in entry.resume_command)
+    # Strip any stray {session_id} from the fresh command (defensive). Substring
+    # strip too — a token like "--session={session_id}" becomes "--session=".
+    return tuple(tok.replace("{session_id}", "") for tok in entry.command)
+
+
 def build_spawn_spec(
     entry: CLIEntry,
     prompt: str,
@@ -89,14 +107,33 @@ def build_spawn_spec(
     cwd: Path,
     options: Mapping[str, object] | None = None,
     extra_env: dict[str, str] | None = None,
+    session_id: str | None = None,
 ) -> SpawnSpec:
-    """Compose a SpawnSpec from a registry entry, a prompt, options, and a cwd.
+    """Compose a SpawnSpec from a registry entry, a prompt, options, cwd, and an
+    optional saved session_id (continues a CLI's prior turn when supported).
 
-    For `argv` mode, the prompt is appended as the final argv element at spawn time
-    (in `spawn()` below, not here — keeps the spec inspectable).
+    For `argv` mode, the prompt is substituted into {prompt} or appended.
     For `stdin` mode, the prompt is piped to stdin by the caller.
     """
-    argv = apply_options(entry, options or {})
+    # apply_options operates on a "base command" which may be the resume variant
+    # when we have a session id — so swap entry.command for that variant briefly.
+    base_argv = _select_command(entry, session_id)
+    # Build an ephemeral CLIEntry-like for apply_options without dataclass mutation
+    extras_entry = CLIEntry(
+        name=entry.name,
+        command=base_argv,
+        invocation_mode=entry.invocation_mode,
+        headless_supported=entry.headless_supported,
+        experimental=entry.experimental,
+        description=entry.description,
+        homepage=entry.homepage,
+        disabled=entry.disabled,
+        env=entry.env,
+        options_schema=entry.options_schema,
+        resume_command=entry.resume_command,
+        session_id_pattern=entry.session_id_pattern,
+    )
+    argv = apply_options(extras_entry, options or {})
     env = {**os.environ, "TERM": "dumb"}
     for k, v in entry.env.items():
         env[k] = v
@@ -113,13 +150,18 @@ def build_spawn_spec(
 
 
 def _resolve_argv_with_prompt(argv: tuple[str, ...], prompt: str) -> tuple[str, ...]:
-    """Substitute the literal "{prompt}" token in argv with the actual prompt.
+    """Substitute the "{prompt}" placeholder in argv with the actual prompt.
 
-    If no "{prompt}" token is present, the prompt is appended at the end (legacy
-    behavior — keeps backwards compat with CLIs declared before placeholders existed).
+    Substring-aware (mirrors `_select_command` v0.4): both whole-token form
+    `"{prompt}"` AND embedded forms like `"--prompt={prompt}"` are supported.
+
+    If no "{prompt}" placeholder is present anywhere, the prompt is appended at
+    the end (legacy behavior — keeps backwards compat with CLIs declared before
+    placeholders existed).
     """
-    if "{prompt}" in argv:
-        return tuple(prompt if t == "{prompt}" else t for t in argv)
+    has_placeholder = any("{prompt}" in tok for tok in argv)
+    if has_placeholder:
+        return tuple(tok.replace("{prompt}", prompt) for tok in argv)
     return (*argv, prompt)
 
 
@@ -157,11 +199,50 @@ async def spawn(spec: SpawnSpec) -> asyncio.subprocess.Process:
     raise ValueError(f"unknown invocation_mode: {spec.invocation_mode}")
 
 
+def extract_session_id(entry: CLIEntry, captured_stdout: str) -> str | None:
+    """Parse the CLI's stdout for a session id using its declared pattern.
+
+    Returns None if the CLI doesn't declare a pattern, or if no match was found.
+    The pattern must have exactly one capture group — the session id itself.
+
+    Two defenses against an attacker- or model-controlled response poisoning the
+    saved session id (Codex bot P2 fix):
+
+    1. **Scan only the tail** of stdout. Real CLIs print their session marker as
+       a footer after model content, so a 4 KB tail is more than enough to catch
+       it while excluding most of the model's prose.
+    2. **Pick the LAST match**, not the first. If the model talks about session
+       IDs in its answer (e.g. quoting docs), the CLI's footer still comes
+       last in stdout order. ``re.findall`` returns the captured groups in
+       order; ``[-1]`` is the rightmost (most recent) one.
+
+    Neither defense is bulletproof, but together they make accidental capture
+    of a value the model emitted vanishingly unlikely without breaking any
+    documented CLI footer format.
+    """
+    if not entry.session_id_pattern:
+        return None
+    import re
+
+    # Tail-only scan. 4 KB is plenty for known CLI footers (uuid + a few lines).
+    tail = captured_stdout[-4096:] if len(captured_stdout) > 4096 else captured_stdout
+    matches = re.findall(entry.session_id_pattern, tail)
+    if not matches:
+        return None
+    last = matches[-1]
+    # `re.findall` returns either a list of strings (1 group) or list of tuples
+    # (≥2 groups). We validate one-group-only at load time, but defend anyway.
+    if isinstance(last, tuple):
+        last = last[0] if last else ""
+    return last or None
+
+
 __all__ = [
     "OptionSpec",
     "RegistryError",
     "SpawnSpec",
     "apply_options",
     "build_spawn_spec",
+    "extract_session_id",
     "spawn",
 ]

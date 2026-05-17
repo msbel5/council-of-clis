@@ -27,6 +27,10 @@ TRUST_STORE = USER_CONFIG_DIR / "trusted_folders.json"
 # System paths that can NEVER be a project_dir, regardless of user trust.
 # `EXACT` blocks only the literal path. `DESCENDANTS` blocks the path and everything under it.
 # (Root `/` and `C:/` go in EXACT — every other path is under root, so we can't blanket-block.)
+#
+# macOS extras (split out — Codex bot P2 v0.4): a Linux user with a legit project
+# under `/private` or `/opt/homebrew` shouldn't be blocked by macOS-only rules.
+# `/Library` and `/System` stay in the shared POSIX list (pre-existing behavior).
 _FORBIDDEN_EXACT_POSIX = (Path("/"),)
 _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/etc"),
@@ -39,6 +43,11 @@ _FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/var/log"),
     Path("/Library"),
     Path("/System"),
+)
+# macOS-only additions: SIP-backing path + Apple-silicon Homebrew prefix.
+_FORBIDDEN_DESCENDANTS_DARWIN_EXTRA = (
+    Path("/private"),
+    Path("/opt/homebrew"),
 )
 _FORBIDDEN_EXACT_WIN = (Path("C:/"), Path("C:\\"))
 _FORBIDDEN_DESCENDANTS_WIN = (
@@ -71,17 +80,26 @@ def _forbidden_exact() -> tuple[Path, ...]:
 def _forbidden_descendants() -> tuple[Path, ...]:
     if sys.platform.startswith("win"):
         return _FORBIDDEN_DESCENDANTS_WIN
+    if sys.platform == "darwin":
+        return _FORBIDDEN_DESCENDANTS_POSIX + _FORBIDDEN_DESCENDANTS_DARWIN_EXTRA
     return _FORBIDDEN_DESCENDANTS_POSIX
 
 
 def _is_under(child: Path, parent: Path) -> bool:
-    """True if `child` is `parent` or any descendant. Case-insensitive on Windows."""
+    """True if `child` is `parent` or any descendant.
+
+    Case-insensitive on Windows (NTFS) and macOS (APFS default). Most macOS
+    installs are case-insensitive APFS; the rare case-sensitive APFS variant
+    just loses the "auto-block" for misspelled-case system paths — the user
+    will still see the trust prompt and approve/decline manually, so we don't
+    relax safety, only ergonomics.
+    """
     try:
         child_resolved = child.resolve(strict=False)
         parent_resolved = parent.resolve(strict=False)
     except OSError:
         return False
-    if sys.platform.startswith("win"):
+    if sys.platform.startswith("win") or sys.platform == "darwin":
         c = str(child_resolved).lower()
         p = str(parent_resolved).lower()
         return c == p or c.startswith(p + os.sep.lower()) or c.startswith(p + "/")

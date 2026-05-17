@@ -1,28 +1,33 @@
-# Council — built-in CLI registry (v0.3).
+# Council — built-in CLI registry (v0.4).
 #
 # Users can override or extend this in `<platform-config-dir>/council/clis.toml`.
 # On Windows: %APPDATA%\Council\clis.toml
 # On macOS:   ~/Library/Application Support/Council/clis.toml
 # On Linux:   ~/.config/Council/clis.toml
 #
-# Each [[cli]] entry is validated by council.registry.CLIEntry.
+# Each [[cli]] entry is validated by council.registry.CLIEntry at load time.
 # Argv is always an array — never a shell string — to avoid escaping issues.
 #
-# Placeholders in `command`:
-#   "{options}"  → spawn.apply_options() substitutes the option tokens at this index
-#                  (placed BEFORE the prompt flag to avoid stealing -p / --prompt slots)
-#   "{prompt}"   → spawn._resolve_argv_with_prompt() substitutes the user prompt
-#                  (argv mode only; stdin-mode CLIs strip this token if present)
+# Placeholders in `command` / `resume_command`:
+#   "{options}"      → spawn.apply_options() splices option tokens here
+#   "{prompt}"       → spawn._resolve_argv_with_prompt() substitutes the user prompt
+#                      (argv mode only; stdin-mode CLIs strip this token if present)
+#   "{session_id}"   → spawn substitutes the saved session id when resuming
 #
-# options_schema: per-CLI option specs. The UI renders these as form controls,
-# spawn templates the chosen value into the argv tokens at spawn time
-# ("{value}" placeholder is replaced; never shell-parsed).
+# Session persistence (v0.4):
+#   resume_command + session_id_pattern must be declared together or both omitted.
+#   When Council has a saved session_id for a CLI in the current conversation, the
+#   `resume_command` template is used instead of `command`. After every run, Council
+#   parses stdout with `session_id_pattern` (one capture group) and saves the id for
+#   the next turn.
 
 # ---- Codex (OpenAI) -------------------------------------------------------
 
 [[cli]]
 name = "codex"
 command = ["codex", "exec", "-", "--skip-git-repo-check", "{options}"]
+resume_command = ["codex", "exec", "resume", "{session_id}", "-", "--skip-git-repo-check", "{options}"]
+session_id_pattern = "[Ss]ession\\s*(?:id|ID|Id)\\s*[:=]\\s*([0-9a-fA-F-]{8,})"
 invocation_mode = "stdin"
 headless_supported = true
 experimental = false
@@ -58,6 +63,8 @@ description = "Filesystem sandbox policy."
 [[cli]]
 name = "claude"
 command = ["claude", "{options}", "--print", "{prompt}"]
+resume_command = ["claude", "--resume", "{session_id}", "{options}", "--print", "{prompt}"]
+session_id_pattern = "(?:[Ss]ession[_\\s]?[Ii][Dd]|conversation[_\\s]?id)\\s*[:=]\\s*([0-9a-fA-F-]{8,})"
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
@@ -85,6 +92,8 @@ description = "Reply format."
 [[cli]]
 name = "copilot"
 command = ["copilot", "-sp", "{prompt}"]
+resume_command = ["copilot", "--resume", "{session_id}", "-sp", "{prompt}"]
+session_id_pattern = "(?:[Ss]ession\\s*[Ii][Dd]|--resume\\s+)([A-Za-z0-9-]{8,})"
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
@@ -98,6 +107,8 @@ homepage = "https://docs.github.com/en/copilot/how-tos/copilot-cli/cli-getting-s
 [[cli]]
 name = "gemini"
 command = ["gemini", "{options}", "-p", "{prompt}"]
+resume_command = ["gemini", "--resume", "{session_id}", "{options}", "-p", "{prompt}"]
+session_id_pattern = "(?:[Ss]ession\\s*[Ii][Dd]|--resume\\s+'?)([0-9a-fA-F-]{8,})"
 invocation_mode = "argv"
 headless_supported = true
 experimental = false
