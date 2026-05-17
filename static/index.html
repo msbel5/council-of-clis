@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Council — multi-CLI orchestrator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Council</h1>
+    <span class="subtitle">multi-CLI orchestrator for Alcyone</span>
+    <span class="conv-id" id="conv-id-display">no conversation</span>
+    <button id="new-conv">+ New conversation</button>
+    <button id="open-status">📋 Status block</button>
+  </header>
+
+  <main>
+    <div class="prompt-area">
+      <div class="cli-selector">
+        <label><input type="checkbox" data-cli="codex" checked /> codex</label>
+        <label><input type="checkbox" data-cli="claude" checked /> claude</label>
+        <label><input type="checkbox" data-cli="copilot" /> copilot</label>
+        <label><input type="checkbox" data-cli="gemini" /> gemini</label>
+        <label class="mode-row">
+          mode:
+          <select id="mode-select">
+            <option value="parallel" selected>parallel — fan out, no chat</option>
+            <option value="debate">debate — see others, revise (2 rounds)</option>
+            <option value="cascade">cascade — drafter → critic → reviser → validator</option>
+            <option value="moa">moa — Mixture-of-Agents (proposers + aggregator)</option>
+            <option value="router">router — classify task, route to specialist</option>
+            <option value="consensus">consensus — vote until AGREE or 3 rounds</option>
+          </select>
+        </label>
+        <label class="status-toggle">
+          <input type="checkbox" id="include-status" checked /> inject status
+        </label>
+      </div>
+      <textarea id="prompt-input" placeholder="Type your prompt (Ctrl+Enter to send)..." rows="6"></textarea>
+      <div class="send-row">
+        <button id="send-btn">Send to selected CLIs</button>
+        <span id="status-msg"></span>
+      </div>
+    </div>
+
+    <div class="panes" id="panes">
+      <!-- panes injected by app.js -->
+    </div>
+  </main>
+
+  <dialog id="status-dialog">
+    <form method="dialog">
+      <h2>Status block (injected before every prompt)</h2>
+      <textarea id="status-editor" rows="20"></textarea>
+      <div class="dialog-buttons">
+        <button id="save-status" type="button">Save</button>
+        <button value="cancel">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
