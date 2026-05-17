@@ -6,24 +6,44 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header>
-    <h1>Council</h1>
-    <span class="subtitle">multi-CLI orchestrator</span>
-    <input type="text" id="project-dir" class="project-input"
-           placeholder="Project folder (e.g. C:\Users\...\alcyone-mind) — leave blank = Council cwd" />
-    <button id="trust-list" title="Manage trusted folders">🔒</button>
-    <span class="conv-id" id="conv-id-display">no conversation</span>
-    <button id="new-conv">+ New conversation</button>
-    <button id="open-status">📋 Status block</button>
+  <header class="header">
+    <div class="header-row primary">
+      <h1>Council</h1>
+      <span class="subtitle">multi-CLI orchestrator</span>
+      <span class="spacer"></span>
+      <span class="conv-id" id="conv-id-display">new conversation will be created on first send</span>
+      <button id="new-conv">+ New conversation</button>
+      <button id="open-status">📋 Status block</button>
+      <button id="trust-list" title="Manage trusted folders">🔒 Trusts</button>
+    </div>
+    <div class="header-row secondary">
+      <label for="project-dir" class="project-label">📁 Project folder:</label>
+      <input
+        type="text"
+        id="project-dir"
+        class="project-input"
+        list="recent-projects"
+        placeholder="paste absolute path, drag a folder from Explorer, or pick from recents — blank = Council cwd"
+        spellcheck="false"
+        autocapitalize="off"
+        autocomplete="off"
+      />
+      <datalist id="recent-projects"></datalist>
+      <span id="project-hint" class="project-hint muted">using Council cwd</span>
+    </div>
   </header>
 
   <main>
     <div class="prompt-area">
-      <div class="cli-selector">
+      <div class="control-row targets-row">
+        <span class="control-label">targets:</span>
         <label><input type="checkbox" data-cli="codex" checked /> codex</label>
         <label><input type="checkbox" data-cli="claude" checked /> claude</label>
         <label><input type="checkbox" data-cli="copilot" /> copilot</label>
         <label><input type="checkbox" data-cli="gemini" /> gemini</label>
+      </div>
+      <div class="control-row execution-row">
+        <span class="control-label">execution:</span>
         <label class="mode-row">
           mode:
           <select id="mode-select">
@@ -39,10 +59,13 @@
           <input type="checkbox" id="include-status" checked /> inject status
         </label>
       </div>
-      <textarea id="prompt-input" placeholder="Type your prompt (Ctrl+Enter to send)..." rows="6"></textarea>
+      <textarea id="prompt-input" placeholder="Type your prompt (Ctrl+Enter to send)..." rows="6" spellcheck="false"></textarea>
+      <div id="run-status" class="run-status" role="status" aria-live="polite">
+        <span class="run-status-icon">●</span>
+        <span class="run-status-text" id="status-msg">ready</span>
+      </div>
       <div class="send-row">
         <button id="send-btn">Send to selected CLIs</button>
-        <span id="status-msg"></span>
       </div>
     </div>
 
@@ -54,7 +77,7 @@
   <dialog id="status-dialog">
     <form method="dialog">
       <h2>Status block (injected before every prompt)</h2>
-      <textarea id="status-editor" rows="20"></textarea>
+      <textarea id="status-editor" rows="20" spellcheck="false"></textarea>
       <div class="dialog-buttons">
         <button id="save-status" type="button">Save</button>
         <button value="cancel">Close</button>
