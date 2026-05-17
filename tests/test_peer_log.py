@@ -114,6 +114,66 @@ def test_latest_per_cli_skips_empty_and_error(tmp_path: Path) -> None:
     assert "c" not in out  # error filtered
 
 
+def test_latest_per_cli_does_not_fall_back_to_stale_after_failure(
+    tmp_path: Path,
+) -> None:
+    """Codex bot v0.5 P2 follow-up: if a CLI's LATEST entry is empty/error,
+    it must be omitted entirely — NOT replaced by an older successful turn.
+
+    Otherwise the next DSU would silently advertise stale "successful" data
+    after the CLI's most recent run failed. The correct semantic is "what
+    was this CLI's most recent response?" and the honest answer is "nothing
+    useful" if the most recent run failed.
+    """
+    path = tmp_path / "peer_log.jsonl"
+    append_entries(
+        path,
+        [
+            # Turn 1: CLI a succeeds, CLI b succeeds
+            _e(1, "a", "a-t1 success"),
+            _e(1, "b", "b-t1 success"),
+            # Turn 2: CLI a fails (empty), CLI b succeeds again
+            _e(2, "a", ""),
+            _e(2, "b", "b-t2 success"),
+        ],
+    )
+    out = latest_per_cli(path)
+    # CLI a's LATEST is empty → must be omitted, NOT replaced by t1 success
+    assert "a" not in out, (
+        f"stale fallback: turn-2 fake-a failed but turn-1 leaked: {out}"
+    )
+    # CLI b's LATEST is fine → included with t2 content
+    assert "b" in out
+    assert out["b"].text == "b-t2 success"
+    assert out["b"].turn == 2
+
+
+def test_latest_per_cli_drops_when_only_entry_is_error(tmp_path: Path) -> None:
+    """Single-turn case: if the CLI's only entry is an error, omit it."""
+    path = tmp_path / "peer_log.jsonl"
+    append_entries(path, [_e(1, "a", "stderr fragment", error=True)])
+    assert "a" not in latest_per_cli(path)
+
+
+def test_latest_per_cli_unfiltered_modes_keep_latest(tmp_path: Path) -> None:
+    """When skip_empty/skip_error are False, the latest entry stays even if
+    empty or errored — the filter is independent of the latest-resolution.
+    """
+    path = tmp_path / "peer_log.jsonl"
+    append_entries(
+        path,
+        [
+            _e(1, "a", "old success"),
+            _e(2, "a", "", error=True),
+        ],
+    )
+    out_strict = latest_per_cli(path, skip_empty=True, skip_error=True)
+    assert "a" not in out_strict
+    out_lax = latest_per_cli(path, skip_empty=False, skip_error=False)
+    assert out_lax["a"].turn == 2
+    assert out_lax["a"].error is True
+
+
 def test_empty_flag_set_for_whitespace_only(tmp_path: Path) -> None:
     entry = _e(1, "x", "   \n  \t  \n")
     assert entry.empty

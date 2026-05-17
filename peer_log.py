@@ -144,23 +144,32 @@ def latest_per_cli(
 
     - `exclude`: drop this CLI from the result (the receiver, who already has
       its own history via --resume; we never inject its own answer back).
-    - `skip_empty`: drop entries with no text content.
-    - `skip_error`: drop entries that come from failed runs (their text is
-      typically a stderr fragment, useless as peer context).
+    - `skip_empty`: drop entries with no text content (after we resolve LATEST
+      per CLI — see Codex bot v0.5 P2 fix).
+    - `skip_error`: drop entries that come from failed runs.
+
+    Filtering happens AFTER we resolve the latest entry per CLI, NOT before.
+    Codex bot v0.5 P2: if turn 1 was successful and turn 2 is empty/failed,
+    filtering inline would skip the empty turn-2 entry and let the stale
+    turn-1 entry stay in the dict — silently advertising old data as if it
+    were current. The correct semantic is "what was this CLI's MOST RECENT
+    response?". If it most recently failed, the CLI is omitted entirely.
 
     Iteration is forward through the tail; later entries overwrite earlier
-    ones for the same CLI, so the final dict holds the most recent.
+    ones for the same CLI, so the intermediate dict holds the most recent
+    (unfiltered) entry per CLI. Then we filter that snapshot.
     """
-    out: dict[str, PeerLogEntry] = {}
+    latest: dict[str, PeerLogEntry] = {}
     for entry in read_tail(path, n=0):
         if entry.cli == exclude:
             continue
-        if skip_empty and entry.empty:
-            continue
-        if skip_error and entry.error:
-            continue
-        out[entry.cli] = entry
-    return out
+        latest[entry.cli] = entry
+    # Filter the resolved latest snapshot, not the iteration in progress.
+    return {
+        cli: entry
+        for cli, entry in latest.items()
+        if not (skip_empty and entry.empty) and not (skip_error and entry.error)
+    }
 
 
 __all__ = [
