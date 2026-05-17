@@ -52,10 +52,17 @@ def apply_options(entry: CLIEntry, options: Mapping[str, object]) -> tuple[str, 
     """
     extras: list[str] = []
     for opt in entry.options_schema:
-        if opt.name not in options:
-            continue
-        raw = options[opt.name]
-        if raw is None or (isinstance(raw, str) and not raw):
+        # Apply user-set value if present, else fall back to schema default.
+        # This guarantees safety-critical defaults (e.g. codex --sandbox read-only)
+        # are applied even on a first send when the user never opened the popover.
+        # (Codex bot review P1 fix.)
+        if opt.name in options:
+            raw = options[opt.name]
+            if raw is None or (isinstance(raw, str) and not raw):
+                continue
+        elif opt.default is not None:
+            raw = opt.default
+        else:
             continue
         coerced = opt.coerce_value(raw)
         if opt.type == "bool":

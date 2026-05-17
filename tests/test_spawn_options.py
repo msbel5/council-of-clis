@@ -236,6 +236,67 @@ def test_spawn_prompt_appended_when_no_placeholder() -> None:
     assert _resolve_argv_with_prompt(argv, "hi") == ("foo", "--flag", "hi")
 
 
+def test_schema_defaults_applied_when_user_omits_option() -> None:
+    """Codex bot P1 #2: defaults must apply on first-send, not require popover open."""
+    entry = CLIEntry(
+        name="codex",
+        command=("codex", "exec", "-", "{options}"),
+        invocation_mode="stdin",
+        options_schema=(
+            OptionSpec(name="model", type="enum", argv=("--model", "{value}"),
+                       choices=("gpt-5.4", "gpt-5.5"), default="gpt-5.4"),
+            OptionSpec(name="sandbox", type="enum", argv=("--sandbox", "{value}"),
+                       choices=("read-only", "workspace-write"), default="read-only"),
+        ),
+    )
+    # User never opened the popover — options dict is empty
+    result = apply_options(entry, {})
+    # But defaults should still apply
+    assert "--sandbox" in result
+    assert "read-only" in result
+    assert "--model" in result
+    assert "gpt-5.4" in result
+
+
+def test_user_override_takes_priority_over_default() -> None:
+    entry = CLIEntry(
+        name="codex",
+        command=("codex", "{options}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="model", type="enum", argv=("--model", "{value}"),
+                       choices=("a", "b"), default="a"),
+        ),
+    )
+    assert apply_options(entry, {"model": "b"}) == ("codex", "--model", "b")
+    assert apply_options(entry, {}) == ("codex", "--model", "a")  # default kicks in
+
+
+def test_bool_default_false_skipped() -> None:
+    entry = CLIEntry(
+        name="x",
+        command=("x", "{options}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="yolo", type="bool", argv=("--yolo",), default=False),
+        ),
+    )
+    # bool default False → flag not included
+    assert apply_options(entry, {}) == ("x",)
+
+
+def test_bool_default_true_included() -> None:
+    entry = CLIEntry(
+        name="x",
+        command=("x", "{options}"),
+        invocation_mode="argv",
+        options_schema=(
+            OptionSpec(name="verbose", type="bool", argv=("-v",), default=True),
+        ),
+    )
+    assert apply_options(entry, {}) == ("x", "-v")
+
+
 def test_gemini_p_flag_gets_prompt_not_options() -> None:
     """Regression for Codex bot P1: `gemini -p` must consume the prompt, not --model."""
     from spawn import _resolve_argv_with_prompt
