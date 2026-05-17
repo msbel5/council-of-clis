@@ -25,8 +25,10 @@ TRUST_STORE = USER_CONFIG_DIR / "trusted_folders.json"
 
 
 # System paths that can NEVER be a project_dir, regardless of user trust.
-_FORBIDDEN_PARENTS_POSIX = (
-    Path("/"),
+# `EXACT` blocks only the literal path. `DESCENDANTS` blocks the path and everything under it.
+# (Root `/` and `C:/` go in EXACT — every other path is under root, so we can't blanket-block.)
+_FORBIDDEN_EXACT_POSIX = (Path("/"),)
+_FORBIDDEN_DESCENDANTS_POSIX = (
     Path("/etc"),
     Path("/usr"),
     Path("/bin"),
@@ -38,7 +40,8 @@ _FORBIDDEN_PARENTS_POSIX = (
     Path("/Library"),
     Path("/System"),
 )
-_FORBIDDEN_PARENTS_WIN = (
+_FORBIDDEN_EXACT_WIN = (Path("C:/"), Path("C:\\"))
+_FORBIDDEN_DESCENDANTS_WIN = (
     Path("C:/Windows"),
     Path("C:/Program Files"),
     Path("C:/Program Files (x86)"),
@@ -59,10 +62,16 @@ class TrustDecision:
     reason: str  # "trusted" | "forbidden:<path>" | "needs-approval" | "not-a-directory"
 
 
-def _forbidden_roots() -> tuple[Path, ...]:
+def _forbidden_exact() -> tuple[Path, ...]:
     if sys.platform.startswith("win"):
-        return _FORBIDDEN_PARENTS_WIN
-    return _FORBIDDEN_PARENTS_POSIX
+        return _FORBIDDEN_EXACT_WIN
+    return _FORBIDDEN_EXACT_POSIX
+
+
+def _forbidden_descendants() -> tuple[Path, ...]:
+    if sys.platform.startswith("win"):
+        return _FORBIDDEN_DESCENDANTS_WIN
+    return _FORBIDDEN_DESCENDANTS_POSIX
 
 
 def _is_under(child: Path, parent: Path) -> bool:
@@ -92,8 +101,22 @@ def canonicalize(raw: str | Path) -> Path:
 
 
 def is_forbidden(canonical: Path) -> str | None:
-    """Return the forbidden parent that contains `canonical`, or None if safe."""
-    for forbidden in _forbidden_roots():
+    """Return the forbidden parent that contains `canonical`, or None if safe.
+
+    EXACT roots (like `/`, `C:\\`) only match if the path is literally that path.
+    DESCENDANT roots (like `/etc`, `C:\\Windows`) match the path or any descendant.
+    """
+    try:
+        resolved = canonical.resolve(strict=False)
+    except OSError:
+        resolved = canonical
+    for forbidden in _forbidden_exact():
+        try:
+            if resolved == forbidden.resolve(strict=False):
+                return str(forbidden)
+        except OSError:
+            continue
+    for forbidden in _forbidden_descendants():
         if _is_under(canonical, forbidden):
             return str(forbidden)
     return None
